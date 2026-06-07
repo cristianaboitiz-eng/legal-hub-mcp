@@ -130,6 +130,22 @@ Verificar que Node.js esté instalado correctamente ejecutando `node --version` 
 Algunos conectores dependen de que las webs oficiales estén disponibles. Si una fuente está caída, el resto sigue funcionando normalmente.
 
 ---
+ 
+## Seguridad y privacidad
+ 
+Una preocupación legítima al conectar cualquier servidor MCP es saber qué hace con las consultas que recibe.
+ 
+Este hub fue diseñado desde el principio para correr localmente en la computadora del usuario, sin ningún servidor en el medio. 
+ 
+**El hub corre en tu máquina y solo en tu máquina.**
+ 
+**Cómo funciona:** el hub corre en tu propia computadora mediante transporte stdio, que es comunicación directa entre Claude Desktop y el servidor sin pasar por ninguna red externa. Las consultas nunca salen de tu máquina hacia un servidor intermediario. Los conectores consultan únicamente las webs jurídicas oficiales públicas (boletines oficiales, bases de jurisprudencia) y devuelven la respuesta directamente a Claude.
+ 
+**Qué no hace este hub:** no registra consultas, no las envía a terceros, no tiene capacidad de accionar sobre sistemas externos más allá de consultar las fuentes jurídicas públicas para las que fue diseñado.
+ 
+**Auditoría:** al ser open source, cualquier abogado o su equipo técnico puede leer el código antes de instalarlo y verificar exactamente qué hace. Todo el código está disponible en este repositorio y en los repositorios originales de cada conector listados en la tabla de fuentes.
+ 
+---
 
 ## Arquitectura
 
