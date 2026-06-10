@@ -38,6 +38,9 @@ const TIMEOUTS = {
     pjnjuris: 60000,
     pjn:      30000,
     saij:     30000,
+    // infoleg tiene cadena de fallbacks con Puppeteer (render JS de
+    // argentina.gob.ar) que no entra en 20s.
+    infoleg:  90000,
 };
 
 // ---------------------------------------------------------------------------
@@ -191,10 +194,15 @@ class ChildMcpClient {
         }, 20000);
         this.notify("notifications/initialized");
         const result = (await this.send("tools/list", {}, 15000));
-        this.tools = (result.tools ?? []).map((t) => ({
-            ...t,
-            name: `${this.prefix}__${stripInternalPrefix(this.prefix, t.name)}`,
-        }));
+        // FIX BUG 8: stripInternalPrefix es destructivo (juba_info -> juba__info)
+        // y el slice posterior en callTool reenviaba "info" al hijo -> -32602.
+        // Guardamos el mapeo nombre expuesto -> nombre original del hijo.
+        this.toolNameMap = new Map();
+        this.tools = (result.tools ?? []).map((t) => {
+            const exposed = `${this.prefix}__${stripInternalPrefix(this.prefix, t.name)}`;
+            this.toolNameMap.set(exposed, t.name);
+            return { ...t, name: exposed };
+        });
         this.ready = true;
         process.stderr.write(`[${this.prefix}] ok - ${this.tools.length} tools\n`);
     }
@@ -204,7 +212,10 @@ class ChildMcpClient {
         if (this.dead) {
             throw new Error(`[${this.prefix}] conector no disponible (proceso terminado)`);
         }
-        const originalName = prefixedName.slice(`${this.prefix}__`.length);
+        // FIX BUG 8: resolver el nombre original via mapa (el slice rompía
+        // tools cuyo nombre interno empieza con el prefijo, ej. juba_info).
+        const originalName = this.toolNameMap?.get(prefixedName)
+            ?? prefixedName.slice(`${this.prefix}__`.length);
         // FIX BUG 4: usar timeout específico para este conector
         const ms = TIMEOUTS[this.prefix] ?? TIMEOUTS.default;
         return this.send("tools/call", { name: originalName, arguments: args }, ms);

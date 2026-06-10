@@ -8,7 +8,9 @@
     "start": "node build/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.17.0",
+    "cheerio": "^1.2.0"
   },
   "engines": {
     "node": ">=18.0.0"

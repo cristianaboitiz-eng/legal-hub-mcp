@@ -327,6 +327,25 @@ async function fetchJubaDocument(idFallo) {
     $('script, noscript, style, nav, header, footer, .nav-custom, #divtope').remove();
     const panelTexto = $('#cphMainContent_pnlTextoCompleto, #cphMainContent_UpdatePanel1').text().replace(/\s+/g, ' ').trim()
         || $('#form1').text().replace(/\s+/g, ' ').trim();
+    // FIX: ID inexistente devolvia un stub HTML con todas las etiquetas vacias.
+    // El stub real (verificado con id 999999) es: "VISUALIZACION DEL TEXTO
+    // COMPLETO DATOS DEL FALLO Materia: Tipo de Fallo: ... Imprimir Descargar
+    // TEXTO COMPLETO TEXTO COMPLETO PRIVADO" (~250 caracteres de puro chrome).
+    // Se eliminan TODOS los rotulos y botones de la UI; si no hay metadatos y
+    // el remanente es trivial o carece de marcadores de contenido juridico,
+    // el fallo no existe.
+    const hasMeta = [materia, tribunal, caratula, nroCausa, fecha, magistrados, tipoFallo]
+        .some((v) => v && v.length > 0);
+    const textoNeto = panelTexto
+        .replace(/VISUALIZACI[ÓO]N DEL TEXTO COMPLETO|DATOS DEL FALLO|TEXTO COMPLETO( PRIVADO)?|Texto Completo/gi, ' ')
+        .replace(/Materia:|Tipo de Fallo:|Tribunal Emisor:|Tribunal Origen:|Causa:|N[º°]? ?de Causa:|Nro Registro Interno:|Car[áa]tula( P[úu]blica)?:|Fecha:|Magistrados Votantes:|NNF:|Observaci[óo]n(es)?:|Sentencias Anuladas:|Alcance:|Iniciales:/gi, ' ')
+        .replace(/\b(Imprimir|Descargar|Volver|Cerrar)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const tieneContenidoJuridico = /VISTOS?|CONSIDERANDO|RESUELVE|SENTENCIA|AUTOS Y VISTOS|recurso|tribunal|expediente/i.test(textoNeto);
+    if (!hasMeta && (textoNeto.length < 120 || !tieneContenidoJuridico)) {
+        throw new Error(`Fallo no encontrado en JUBA: el ID ${idFallo} no existe o no tiene texto completo disponible. Verifique el ID con una busqueda previa (las busquedas devuelven el ID correcto de cada fallo).`);
+    }
     return {
         url,
         materia, tribunal, caratula, nroCausa, fecha, magistrados, tipoFallo,

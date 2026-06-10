@@ -166,10 +166,21 @@ export function buildSearchQuery(args) {
             });
         }
         else {
+            // Usar multi_match en lugar de query_string para evitar "all shards failed"
+            // query_string sin fields intenta buscar en campos numéricos y falla en el índice PTN
             must.push({
-                query_string: {
+                multi_match: {
                     query: String(args.criterio),
-                    default_operator: "AND",
+                    fields: [
+                        "doctrina",
+                        "sintesis",
+                        "organismo",
+                        "voces",
+                        "numero",
+                        "expediente"
+                    ],
+                    operator: "and",
+                    type: "cross_fields"
                 },
             });
         }
@@ -985,98 +996,40 @@ Conector automatizado con fines de investigacion. No constituye asesoramiento ju
     }, async (args) => {
         try {
             const text = args.texto_dictamen;
-            // Enhanced deadline detection patterns following InfoLeg pattern (Trace 3)
+            // FIX FALSOS NEGATIVOS:
+            // 1. La regex de fechas tenia flag /g y se reutilizaba con .test()
+            //    sobre varios parrafos -> lastIndex sucio salteaba matches.
+            // 2. "\d+\s+(días?\s+(habiles|corridos)?|...)" exigia espacio despues
+            //    de "días" aunque no hubiera calificador -> "10 días." no matcheaba.
+            // 3. No cubria los formatos reales: "diez (10) días hábiles",
+            //    "treinta días corridos", "contados desde la notificación",
+            //    "bajo apercibimiento", "perentorio".
+            // Los ~85 patrones "plazo de castigo / estadía / poder" eran relleno
+            // sin correlato en dictamenes reales y generaban falsos positivos.
+            const NUM_LETRAS = "(?:un[oa]?|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|quince|veinte|treinta|cuarenta\\s+y\\s+cinco|cuarenta|cincuenta|sesenta|noventa|ciento\\s+veinte|ciento\\s+ochenta)";
+            const UNIDAD = "(?:d[ií]as?|mes(?:es)?|a[ñn]os?|horas?|semanas?)";
+            const CALIF = "(?:\\s+(?:h[áa]biles?|corridos?|laborables?|administrativos?|judiciales?))?";
             const patterns = [
-                // Numeric deadlines
-                { regex: /\b\d+\s+(días?\s+(habiles|corridos|hábiles|laborales)?|meses|años?)\b/i, name: "Plazo numérico" },
-                { regex: /\b(plazo|término)\s+de\s+(días?|meses|años?)\b/i, name: "Cláusula de plazo" },
-                // Prescription and caducity
-                { regex: /\b(prescribe|prescripción)\b/i, name: "Prescripción" },
-                { regex: /\b(caduca|caducidad)\b/i, name: "Caducidad" },
-                { regex: /\b(vencimiento|mora)\b/i, name: "Vencimiento/Mora" },
-                // Date formats
-                { regex: /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/g, name: "Fecha específica" },
-                { regex: /\b(hasta\s+el\s+(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|el\s+día\s+\d+))/i, name: "Fecha límite" },
-                // Notification and procedural deadlines
-                { regex: /\b(dentro\s+de\s+(?:los\s+)?\d+\s+(días?|meses|años?))\b/i, name: "Plazo desde notificación" },
-                { regex: /\b(notificar|notificación|citar|citación)\b/i, name: "Notificación/Citación" },
-                { regex: /\b(intervención|interventor|administración)\b/i, name: "Plazo de intervención" },
-                // Additional legal/administrative patterns (InfoLeg enhancement)
-                { regex: /\b(plazo\s+máximo|plazo\s+mínimo)\b/i, name: "Plazo máximo/mínimo" },
-                { regex: /\b(vence|vencimiento|expira|expiración)\b/i, name: "Vencimiento/Expiración" },
-                { regex: /\b(prórroga|prorrogar|extensión)\b/i, name: "Prórroga/Extensión" },
-                { regex: /\b(suspensión|suspender)\b/i, name: "Suspensión" },
-                { regex: /\b(interrupción|interrumpir)\b/i, name: "Interrupción" },
-                { regex: /\b(reinicio|reanudación)\b/i, name: "Reinicio/Reanudación" },
-                { regex: /\b(plazo\s+de\s+gracia|período\s+de\s+gracia)\b/i, name: "Plazo de gracia" },
-                { regex: /\b(plazo\s+legal|plazo\s+normativo)\b/i, name: "Plazo legal/normativo" },
-                { regex: /\b(plazo\s+administrativo|plazo\s+reglamentario)\b/i, name: "Plazo administrativo" },
-                { regex: /\b(término\s+de\s+comparecencia|comparecer)\b/i, name: "Comparecencia" },
-                { regex: /\b(plazo\s+de\s+apelación|apelar)\b/i, name: "Plazo de apelación" },
-                { regex: /\b(plazo\s+de\s+recurso|recurso)\b/i, name: "Plazo de recurso" },
-                { regex: /\b(plazo\s+de\s+impugnación|impugnar)\b/i, name: "Plazo de impugnación" },
-                { regex: /\b(plazo\s+de\s+oposición|oponer)\b/i, name: "Plazo de oposición" },
-                { regex: /\b(plazo\s+de\s+contestación|contestar)\b/i, name: "Plazo de contestación" },
-                { regex: /\b(plazo\s+de\s+presentación|presentar)\b/i, name: "Plazo de presentación" },
-                { regex: /\b(plazo\s+de\s+inscripción|inscribir)\b/i, name: "Plazo de inscripción" },
-                { regex: /\b(plazo\s+de\s+renuncia|renunciar)\b/i, name: "Plazo de renuncia" },
-                { regex: /\b(plazo\s+de\s+aceptación|aceptar)\b/i, name: "Plazo de aceptación" },
-                { regex: /\b(plazo\s+de\s+ejecución|ejecutar)\b/i, name: "Plazo de ejecución" },
-                { regex: /\b(plazo\s+de\s+cumplimiento|cumplir)\b/i, name: "Plazo de cumplimiento" },
-                { regex: /\b(plazo\s+de\s+vigencia|vigencia)\b/i, name: "Plazo de vigencia" },
-                { regex: /\b(plazo\s+de\s+validez|validez)\b/i, name: "Plazo de validez" },
-                { regex: /\b(plazo\s+de\s+duración|duración)\b/i, name: "Plazo de duración" },
-                { regex: /\b(plazo\s+de\s+permanencia|permanencia)\b/i, name: "Plazo de permanencia" },
-                { regex: /\b(plazo\s+de\s+estadía|estadía)\b/i, name: "Plazo de estadía" },
-                { regex: /\b(plazo\s+de\s+residencia|residencia)\b/i, name: "Plazo de residencia" },
-                { regex: /\b(plazo\s+de\s+domicilio|domicilio)\b/i, name: "Plazo de domicilio" },
-                { regex: /\b(plazo\s+de\s+notificación|notificar)\b/i, name: "Plazo de notificación" },
-                { regex: /\b(plazo\s+de\s+emisión|emitir)\b/i, name: "Plazo de emisión" },
-                { regex: /\b(plazo\s+de\s+entrega|entregar)\b/i, name: "Plazo de entrega" },
-                { regex: /\b(plazo\s+de\s+devolución|devolver)\b/i, name: "Plazo de devolución" },
-                { regex: /\b(plazo\s+de\s+reintegro|reintegrar)\b/i, name: "Plazo de reintegro" },
-                { regex: /\b(plazo\s+de\s+reembolso|reembolsar)\b/i, name: "Plazo de reembolso" },
-                { regex: /\b(plazo\s+de\s+reparación|reparar)\b/i, name: "Plazo de reparación" },
-                { regex: /\b(plazo\s+de\s+subsistencia|subsistir)\b/i, name: "Plazo de subsistencia" },
-                { regex: /\b(plazo\s+de\s+conservación|conservar)\b/i, name: "Plazo de conservación" },
-                { regex: /\b(plazo\s+de\s+custodia|custodiar)\b/i, name: "Plazo de custodia" },
-                { regex: /\b(plazo\s+de\s+guarda|guardar)\b/i, name: "Plazo de guarda" },
-                { regex: /\b(plazo\s+de\s+depósito|depositar)\b/i, name: "Plazo de depósito" },
-                { regex: /\b(plazo\s+de\s+retención|retener)\b/i, name: "Plazo de retención" },
-                { regex: /\b(plazo\s+de\s+consignación|consignar)\b/i, name: "Plazo de consignación" },
-                { regex: /\b(plazo\s+de\s+liberación|liberar)\b/i, name: "Plazo de liberación" },
-                { regex: /\b(plazo\s+de\s+libertad|libertad)\b/i, name: "Plazo de libertad" },
-                { regex: /\b(plazo\s+de\s+detención|detener)\b/i, name: "Plazo de detención" },
-                { regex: /\b(plazo\s+de\s+prisión|prisión)\b/i, name: "Plazo de prisión" },
-                { regex: /\b(plazo\s+de\s+condena|condena)\b/i, name: "Plazo de condena" },
-                { regex: /\b(plazo\s+de\s+sanción|sancionar)\b/i, name: "Plazo de sanción" },
-                { regex: /\b(plazo\s+de\s+multa|multar)\b/i, name: "Plazo de multa" },
-                { regex: /\b(plazo\s+de\s+pena|pena)\b/i, name: "Plazo de pena" },
-                { regex: /\b(plazo\s+de\s+castigo|castigar)\b/i, name: "Plazo de castigo" },
-                { regex: /\b(plazo\s+de\s+suspensión|suspender)\b/i, name: "Plazo de suspensión" },
-                { regex: /\b(plazo\s+de\s+inhabilitación|inhabilitar)\b/i, name: "Plazo de inhabilitación" },
-                { regex: /\b(plazo\s+de\s+destitución|destituir)\b/i, name: "Plazo de destitución" },
-                { regex: /\b(plazo\s+de\s+separación|separar)\b/i, name: "Plazo de separación" },
-                { regex: /\b(plazo\s+de\s+remoción|remover)\b/i, name: "Plazo de remoción" },
-                { regex: /\b(plazo\s+de\s+cese|cesar)\b/i, name: "Plazo de cese" },
-                { regex: /\b(plazo\s+de\s+terminación|terminar)\b/i, name: "Plazo de terminación" },
-                { regex: /\b(plazo\s+de\s+finalización|finalizar)\b/i, name: "Plazo de finalización" },
-                { regex: /\b(plazo\s+de\s+conclusión|concluir)\b/i, name: "Plazo de conclusión" },
-                { regex: /\b(plazo\s+de\s+cierre|cerrar)\b/i, name: "Plazo de cierre" },
-                { regex: /\b(plazo\s+de\s+clausura|clausurar)\b/i, name: "Plazo de clausura" },
-                { regex: /\b(plazo\s+de\s+extinción|extinguir)\b/i, name: "Plazo de extinción" },
-                { regex: /\b(plazo\s+de\s+anulación|anular)\b/i, name: "Plazo de anulación" },
-                { regex: /\b(plazo\s+de\s+revocación|revocar)\b/i, name: "Plazo de revocación" },
-                { regex: /\b(plazo\s+de\s+rescisión|rescindir)\b/i, name: "Plazo de rescisión" },
-                { regex: /\b(plazo\s+de\s+resolución|resolver)\b/i, name: "Plazo de resolución" },
-                { regex: /\b(plazo\s+de\s+decisión|decidir)\b/i, name: "Plazo de decisión" },
-                { regex: /\b(plazo\s+de\s+jurisdicción|jurisdicción)\b/i, name: "Plazo de jurisdicción" },
-                { regex: /\b(plazo\s+de\s+competencia|competencia)\b/i, name: "Plazo de competencia" },
-                { regex: /\b(plazo\s+de\s+atribución|atribución)\b/i, name: "Plazo de atribución" },
-                { regex: /\b(plazo\s+de\s+facultad|facultad)\b/i, name: "Plazo de facultad" },
-                { regex: /\b(plazo\s+de\s+poder|poder)\b/i, name: "Plazo de poder" },
-                { regex: /\b(plazo\s+de\s+autoridad|autoridad)\b/i, name: "Plazo de autoridad" },
-                { regex: /\b(plazo\s+de\s+jurisdicción|jurisdicción)\b/i, name: "Plazo de jurisdicción" },
+                // "10 días hábiles", "diez (10) días", "treinta días corridos", "10 días."
+                { regex: new RegExp(`\\b(?:\\d+|${NUM_LETRAS})\\s*(?:\\(\\s*\\d+\\s*\\)\\s*)?${UNIDAD}${CALIF}`, "i"), name: "Plazo numérico" },
+                // "plazo de diez días", "término máximo de 30 días", "plazo de ley"
+                { regex: /\b(?:plazo|t[ée]rmino)s?\s+(?:m[áa]ximo\s+|m[íi]nimo\s+|perentorio\s+)?de\b/i, name: "Cláusula de plazo" },
+                // "dentro del plazo", "dentro de los diez (10) días"
+                { regex: new RegExp(`\\bdentro\\s+de(?:l\\s+(?:plazo|t[ée]rmino)|\\s+l[oa]s?\\s+(?:\\d+|${NUM_LETRAS}))`, "i"), name: "Plazo de cumplimiento" },
+                // "contados desde...", "a partir de la notificación/publicación"
+                { regex: /\b(?:contad[oa]s?\s+(?:desde|a\s+partir)|a\s+partir\s+de\s+(?:la\s+)?(?:notificaci[óo]n|publicaci[óo]n|recepci[óo]n|fecha))/i, name: "Cómputo de plazo" },
+                { regex: /\b(?:prescrib\w+|prescripci[óo]n|prescript\w+)\b/i, name: "Prescripción" },
+                { regex: /\bcaduc\w+\b/i, name: "Caducidad" },
+                { regex: /\b(?:perentori[oa]s?|improrrogables?|fatal(?:es)?)\b/i, name: "Plazo perentorio" },
+                { regex: /\b(?:venc\w+|expir\w+|\bmora\b)/i, name: "Vencimiento/Mora" },
+                { regex: /\b(?:pr[óo]rrog\w+|prorrog\w+)\b/i, name: "Prórroga" },
+                { regex: /\b(?:suspensi[óo]n|interrupci[óo]n)\s+(?:de(?:l)?\s+)?(?:plazo|t[ée]rmino|curso)/i, name: "Suspensión/Interrupción de plazo" },
+                { regex: /\bbajo\s+apercibimiento\b/i, name: "Apercibimiento" },
+                // Fechas: 10/03/2026, 10-3-26, "1° de marzo de 2026"
+                { regex: /\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/, name: "Fecha específica" },
+                { regex: /\b\d{1,2}[°º]?\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)(?:\s+de\s+\d{4})?\b/i, name: "Fecha en letras" },
+                { regex: /\bhasta\s+el\s+(?:d[íi]a\s+)?\d/i, name: "Fecha límite" },
+                { regex: /\b(?:antes\s+del?\b|a\s+m[áa]s\s+tardar)/i, name: "Fecha límite" },
             ];
             // Split text into paragraphs for analysis (InfoLeg pattern Trace 3c)
             const paragraphs = text.split(/\n\n+/);
@@ -1087,7 +1040,8 @@ Conector automatizado con fines de investigacion. No constituye asesoramiento ju
                     continue;
                 const foundMatches = [];
                 for (const pattern of patterns) {
-                    if (pattern.regex.test(trimmed)) {
+                    pattern.regex.lastIndex = 0; // higiene por si algun patron trae flag g
+                    if (pattern.regex.test(trimmed) && !foundMatches.includes(pattern.name)) {
                         foundMatches.push(pattern.name);
                     }
                 }

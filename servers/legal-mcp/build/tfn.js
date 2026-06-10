@@ -3,14 +3,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import axios from "axios";
-import https from "https";
 import { installTlsFallback } from "./tls-fallback.js";
 
 export const stringOrNumberOptional = z.union([z.string(), z.number()]).transform(val => String(val)).optional();
 
 const axiosClient = axios.create();
 // TLS estricto por defecto; fallback inseguro solo ante cert roto (ver tls-fallback.js).
-const httpsAgent = installTlsFallback(axiosClient, "tfn");
+installTlsFallback(axiosClient, "tfn");
 
 const TFN_BASE_URL = "https://jurisprudenciatfn.mecon.gob.ar";
 const API_CANDIDATES = [
@@ -304,13 +303,24 @@ export function registerAllTools(server) {
     server.tool("buscar_resolucion_por_expediente",
         "Busca una resolucion especifica del TFN por su numero de expediente exacto.",
         {
-            numero_expediente: z.string().describe("Numero de expediente (ej. '12345-67' o 'TFN-12345/2020')."),
+            numero_expediente: z.string().optional().describe("Numero de expediente (ej. '12345-67' o 'TFN-12345/2020')."),
+            expediente: z.string().optional().describe("Alias de numero_expediente (aceptado por compatibilidad)."),
             competencia: z.enum(["impositiva", "aduana"]).optional().describe("Competencia (opcional).")
         },
         async (args) => {
             try {
-                const results = await buscarResoluciones({ expediente: args.numero_expediente, competencia: args.competencia });
-                let md = `# TFN - Busqueda por Expediente\n\n**Expediente:** ${args.numero_expediente}\n`;
+                // FIX: el esquema solo aceptaba numero_expediente y quien llamaba
+                // con "expediente" recibia un -32602 criptico. Se acepta el alias
+                // y se valida en runtime con mensaje explicito.
+                const nroExpediente = args.numero_expediente || args.expediente;
+                if (!nroExpediente) {
+                    return {
+                        content: [{ type: "text", text: "Falta el numero de expediente. Use el parametro 'numero_expediente' (ej. '12345-67' o 'TFN-12345/2020')." }],
+                        isError: true
+                    };
+                }
+                const results = await buscarResoluciones({ expediente: nroExpediente, competencia: args.competencia });
+                let md = `# TFN - Busqueda por Expediente\n\n**Expediente:** ${nroExpediente}\n`;
                 if (args.competencia) md += `**Competencia:** ${args.competencia}\n`;
                 md += `\n`;
                 const items = results.data || [];

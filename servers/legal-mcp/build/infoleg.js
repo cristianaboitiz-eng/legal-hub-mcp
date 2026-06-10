@@ -9,27 +9,106 @@ import { installTlsFallback } from "./tls-fallback.js";
 
 // TLS estricto por defecto; fallback inseguro solo ante cert roto (ver tls-fallback.js).
 const httpsAgent = installTlsFallback(axios, "infoleg");
+// Set completo de headers de navegador: los WAF (ModSecurity y similares)
+// suelen rechazar peticiones con sets incompletos aunque el User-Agent sea valido.
 const OFFICIAL_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8",
-    "Cache-Control": "no-cache"
+    "Accept-Encoding": "gzip, deflate",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"'
 };
+// Detecta paginas de bloqueo (WAF / Forbidden) devueltas con o sin status de error,
+// para que nunca se entreguen como si fueran contenido normativo.
+function assertNotWafPage(html, url) {
+    const plain = String(html).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    const sample = plain.slice(0, 400).toLowerCase();
+    const looksBlocked = sample.includes("you don't have permission") ||
+        sample.includes("you do not have permission") ||
+        sample.includes("access denied") ||
+        sample.includes("request rejected") ||
+        (sample.includes("forbidden") && plain.length < 600);
+    if (looksBlocked) {
+        const wafError = new Error(`El portal devolvio una pagina de bloqueo (WAF/Forbidden) en ${url}. ` +
+            `Contenido recibido: "${plain.slice(0, 160)}"`);
+        wafError.isWafBlock = true;
+        throw wafError;
+    }
+}
 const ARGENTINA_BASE_URL = "https://www.argentina.gob.ar";
-const GEOBLOCK_MSG =
-    `⚠️ **InfoLEG requiere IP argentina.**\n\n` +
-    `El portal servicios.infoleg.gob.ar restringe el acceso a IPs de Argentina. ` +
-    `Este conector funciona correctamente desde **Claude Desktop instalado en una máquina con IP argentina**.\n\n` +
-    `**Alternativas disponibles:**\n` +
-    `- Usá Claude Desktop localmente desde Argentina.\n` +
-    `- Si tenés el texto de la norma, pegalo en el campo \`textoHtmlManual\` para procesarlo sin conexión al portal.\n` +
-    `- Para consultar manualmente: https://servicios.infoleg.gob.ar/infolegInternet/`;
-
-function isGeoblockError(err) {
-    if (!err) return false;
+// NOTA: el "geoblock" de InfoLEG resulto ser un mito. servicios.infoleg.gob.ar
+// responde desde cualquier IP. Los errores reales son: (a) URL estatica mal
+// construida (rangos de 5000, no 50000), (b) entornos que filtran egress de red
+// ("Host not in allowlist"), (c) fallas transitorias del portal. Por eso ahora
+// los errores de conexion se reportan con el detalle real, sin diagnostico enlatado.
+function errorBodyText(err) {
+    try {
+        const data = err?.response?.data;
+        if (!data)
+            return "";
+        if (typeof data === "string")
+            return data;
+        if (Buffer.isBuffer(data))
+            return data.toString("latin1");
+        if (data instanceof ArrayBuffer)
+            return Buffer.from(data).toString("latin1");
+        return JSON.stringify(data);
+    }
+    catch {
+        return "";
+    }
+}
+function describeNetworkError(err) {
+    if (!err)
+        return "error desconocido";
+    const parts = [];
     const status = err.response?.status;
-    const body = err.response?.data?.toString() || err.message || "";
-    return status === 403 || body.includes("Host not in allowlist") || body.includes("Prohibido") || body.includes("Forbidden");
+    if (status)
+        parts.push(`HTTP ${status}${err.response?.statusText ? " " + err.response.statusText : ""}`);
+    if (err.code)
+        parts.push(`codigo ${err.code}`);
+    if (err.message && !parts.length)
+        parts.push(err.message);
+    else if (err.message && !err.response)
+        parts.push(err.message);
+    const snippet = errorBodyText(err).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 250);
+    if (snippet)
+        parts.push(`respuesta: "${snippet}"`);
+    return parts.join(" | ") || String(err.message || err);
+}
+function buildConnectionError(err, url) {
+    const detail = describeNetworkError(err);
+    const haystack = `${errorBodyText(err)} ${err?.message || ""}`;
+    let hint = "";
+    if (haystack.includes("Host not in allowlist")) {
+        hint = `\n\n**Causa:** el entorno donde corre el MCP filtra la salida de red y este host no esta en su lista de permitidos. ` +
+            `No es un bloqueo de InfoLEG. Probalo desde un chat comun de Claude Desktop.`;
+    }
+    else if (err?.response?.status === 403) {
+        hint = `\n\n**Nota:** el portal devolvio 403. NO es geoblock (el sitio responde desde cualquier IP); ` +
+            `suele ser el WAF rechazando la peticion puntual. Reintentar suele alcanzar.`;
+    }
+    const connError = new Error(`⚠️ **Error de conexion con InfoLEG.**\n\n` +
+        `- **URL:** ${url}\n` +
+        `- **Detalle:** ${detail}${hint}\n\n` +
+        `**Alternativa:** si tenes el texto de la norma, pegalo en el campo \`textoHtmlManual\`.`);
+    connError.isGeoblock = true; // reutiliza el plumbing existente para mostrar el mensaje verbatim
+    return connError;
+}
+function isGeoblockError(err) {
+    if (!err)
+        return false;
+    const body = `${errorBodyText(err)} ${err.message || ""}`;
+    return err.response?.status === 403 || body.includes("Host not in allowlist");
 }
 
 // Helper Zod validators
@@ -130,13 +209,18 @@ function buildNormativaSearchUrl(params) {
     query.set("offset", String(params.pagina && params.pagina > 0 ? params.pagina : 1));
     return `${ARGENTINA_BASE_URL}/normativa?${query.toString()}`;
 }
-async function searchNormativaOfficial(params) {
-    const url = buildNormativaSearchUrl(params);
-    const html = await fetchOfficialHtml(url);
+function parseNormativaListHtml(html, opts = {}) {
+    // allowAnchorScan: el escaneo directo de anchors SOLO es confiable sobre la
+    // pagina renderizada por JS. Sobre el HTML estatico levanta los destacados
+    // de "novedades normativas" de la landing (ej. /norma-426271) y los
+    // presenta como falsos resultados de busqueda (bug verificado 10/6/26 con
+    // "locacion de obra" -> 3 decretos laborales ajenos al criterio).
+    const allowAnchorScan = opts.allowAnchorScan ?? false;
     const $ = cheerio.load(html);
     const pageText = normalizeText($("body").text());
     const countText = pageText.match(/\d+\s+normas?\s+encontradas?.*?\d+\s+p\S+gina/i)?.[0] || "";
     const results = [];
+    const seen = new Set();
     $("table tbody tr").each((_, row) => {
         const cells = $(row).find("td");
         if (cells.length < 2)
@@ -147,8 +231,13 @@ async function searchNormativaOfficial(params) {
         const title = normalizeText(link.text());
         if (!title || !href.includes("/normativa/"))
             return;
+        const id = extractInfoLegId(href);
+        if (id && seen.has(id))
+            return;
+        if (id)
+            seen.add(id);
         results.push({
-            id: extractInfoLegId(href),
+            id,
             titulo: title,
             organismo: normalizeText(firstCell.find("p.small").first().text()),
             descripcion: normalizeText(cells.eq(1).text()),
@@ -157,7 +246,81 @@ async function searchNormativaOfficial(params) {
             enlaceTexto: `${absoluteArgentinaUrl(href)}/texto`
         });
     });
-    return { url, countText, results };
+    // Estrategia 2: layout no tabular (cards/listas) - escaneo directo de anchors
+    // a fichas de norma con ID infoleg al final del slug.
+    if (results.length === 0 && allowAnchorScan) {
+        $("a[href*='/normativa/nacional/'], a[href*='/normativa/provincial/']").each((_, el) => {
+            const href = $(el).attr("href") || "";
+            if (/\/(texto|normas-modificadas|normas-modifican)\/?$/.test(href))
+                return;
+            // Los destacados de la landing usan el slug generico /norma-{id};
+            // los resultados reales usan /{tipo}-{numero}-{id}. Excluirlos evita
+            // contaminar la respuesta con novedades ajenas al criterio.
+            if (/\/norma-\d+\/?$/.test(href))
+                return;
+            const id = extractInfoLegId(href);
+            if (!id || seen.has(id))
+                return;
+            const titulo = normalizeText($(el).text());
+            if (!titulo || titulo.length > 200)
+                return;
+            seen.add(id);
+            const block = $(el).closest("li, tr, article, .card, div").first();
+            const resumen = normalizeText(block.text()).replace(titulo, "").trim().slice(0, 250);
+            results.push({
+                id,
+                titulo,
+                organismo: "",
+                descripcion: resumen,
+                paginaBoletin: "",
+                enlaceResumen: absoluteArgentinaUrl(href),
+                enlaceTexto: `${absoluteArgentinaUrl(href).replace(/\/$/, "")}/texto`
+            });
+        });
+    }
+    return { countText, results };
+}
+export async function searchNormativaOfficial(params) {
+    const url = buildNormativaSearchUrl(params);
+    // Intento estatico (rapido). NOTA: el buscador de argentina.gob.ar renderiza
+    // los resultados por JS, asi que el HTML estatico casi siempre trae 0.
+    let parsed = { countText: "", results: [] };
+    let staticError = null;
+    try {
+        const html = await fetchOfficialHtml(url);
+        // Sin anchor-scan: el HTML estatico solo es confiable si trae la tabla
+        // de resultados real (ver nota en parseNormativaListHtml).
+        parsed = parseNormativaListHtml(html, { allowAnchorScan: false });
+    }
+    catch (err) {
+        staticError = err;
+    }
+    let metodo = "HTML estatico";
+    // FIX BUSCADOR CIEGO: render real de la pagina con Puppeteer. La SPA lee
+    // los parametros de la URL, dispara su XHR interno y pinta los resultados;
+    // no hace falta conocer el endpoint JSON.
+    if (parsed.results.length === 0) {
+        try {
+            const rendered = await fetchWithPuppeteer(url, {
+                waitForSelector: "table tbody tr a[href*='/normativa/'], a[href*='/normativa/nacional/'], a[href*='/normativa/provincial/']",
+                waitTimeout: 20000
+            });
+            const renderedParsed = parseNormativaListHtml(rendered, { allowAnchorScan: true });
+            if (renderedParsed.results.length > 0 || !staticError) {
+                parsed = renderedParsed;
+                metodo = "render JS (Puppeteer)";
+            }
+        }
+        catch (puppeteerErr) {
+            if (staticError)
+                throw buildConnectionError(staticError, url);
+            // El HTML estatico respondio pero sin resultados y el render fallo:
+            // devolver 0 aca seria mentir (puede haber miles de normas). Mejor
+            // propagar la causa real (ej. "Puppeteer no esta instalado").
+            throw new Error(`El buscador de argentina.gob.ar requiere render JS y el render fallo: ${puppeteerErr.message} (URL: ${url})`);
+        }
+    }
+    return { url, countText: parsed.countText, results: parsed.results, metodo };
 }
 function buildBoletinUrl(params) {
     const query = new URLSearchParams();
@@ -170,9 +333,7 @@ function buildBoletinUrl(params) {
     query.set("offset", String(params.pagina && params.pagina > 0 ? params.pagina : 1));
     return `${ARGENTINA_BASE_URL}/normativa/buscar-boletin?${query.toString()}`;
 }
-async function fetchBoletin(params) {
-    const url = buildBoletinUrl(params);
-    const html = await fetchOfficialHtml(url);
+function parseBoletinHtml(html) {
     const $ = cheerio.load(html);
     const pageText = normalizeText($("body").text());
     const headingMatch = pageText.match(/Sumario\s+N\S*\s+(\d+)\s+del\s+Bolet\S+n Oficial de la Rep\S+blica Argentina/i);
@@ -198,10 +359,44 @@ async function fetchBoletin(params) {
         });
     });
     return {
-        url,
-        numeroBoletin: headingMatch ? headingMatch[1] : params.numeroBoletin || "",
+        numeroBoletin: headingMatch ? headingMatch[1] : "",
         fechaPublicacion: dateMatch ? dateMatch[1] : "",
         entries
+    };
+}
+async function fetchBoletin(params) {
+    const url = buildBoletinUrl(params);
+    let parsed = { numeroBoletin: "", fechaPublicacion: "", entries: [] };
+    let staticError = null;
+    try {
+        const html = await fetchOfficialHtml(url);
+        parsed = parseBoletinHtml(html);
+    }
+    catch (err) {
+        staticError = err;
+    }
+    // FIX BUSCADOR CIEGO: el sumario del boletin tambien se renderiza por JS.
+    if (parsed.entries.length === 0) {
+        try {
+            const rendered = await fetchWithPuppeteer(url, {
+                waitForSelector: "table tbody tr a[href*='/normativa/'], a[href*='/normativa/nacional/']",
+                waitTimeout: 20000
+            });
+            const renderedParsed = parseBoletinHtml(rendered);
+            if (renderedParsed.entries.length > 0 || !staticError)
+                parsed = renderedParsed;
+        }
+        catch (puppeteerErr) {
+            if (staticError)
+                throw buildConnectionError(staticError, url);
+            throw new Error(`El sumario del boletin en argentina.gob.ar requiere render JS y el render fallo: ${puppeteerErr.message} (URL: ${url})`);
+        }
+    }
+    return {
+        url,
+        numeroBoletin: parsed.numeroBoletin || params.numeroBoletin || "",
+        fechaPublicacion: parsed.fechaPublicacion,
+        entries: parsed.entries
     };
 }
 function formatResultsList(title, sourceUrl, results) {
@@ -262,6 +457,10 @@ async function fetchNormaDetailByUrl(url) {
 async function resolveNormaDetailUrl(args) {
     if (args.urlNorma)
         return args.urlNorma;
+    // FIX: con idNorma la ficha es deterministica y server-rendered; no hace
+    // falta pasar por el buscador (que requiere render JS).
+    if (args.idNorma)
+        return `${ARGENTINA_BASE_URL}/normativa/nacional/${args.idNorma}`;
     if (args.tipoNorma || args.numeroNorma || args.anioNorma) {
         const result = await searchNormativaOfficial({
             jurisdiccion: "nacional",
@@ -276,12 +475,15 @@ async function resolveNormaDetailUrl(args) {
     throw new Error("No se pudo resolver la URL oficial de resumen. Pasa urlNorma o combina tipoNorma/numeroNorma/anioNorma.");
 }
 export function getInfoLegRange(idStr) {
+    // InfoLEG agrupa los anexos en carpetas de 5000 IDs (ej. 295000-299999),
+    // NO de 50000. Verificado contra URLs reales del portal (verNorma.do y
+    // los enlaces de leyes que devuelve la API de PTN).
     const idNum = parseInt(idStr, 10);
     if (isNaN(idNum) || idNum < 0) {
-        return "0-49999";
+        return "0-4999";
     }
-    const floorLimit = Math.floor(idNum / 50000) * 50000;
-    const ceilLimit = floorLimit + 49999;
+    const floorLimit = Math.floor(idNum / 5000) * 5000;
+    const ceilLimit = floorLimit + 4999;
     return `${floorLimit}-${ceilLimit}`;
 }
 export function getInfoLegStaticUrl(idStr, tipoTexto = "actualizado") {
@@ -380,8 +582,10 @@ export function cleanInfoLegHtml(html) {
 function parseSearchResults(html) {
     const $ = cheerio.load(html);
     const results = [];
+    const seen = new Set();
+    // Strategy 1: table rows (classic layout)
     $("table tr").each((_, row) => {
-        const link = $(row).find("a[href*='verNorma.do']").first();
+        const link = $(row).find("a[href*='verNorma.do']").not("[href*='resaltar']").first();
         if (!link.length)
             return;
         const href = link.attr("href") || "";
@@ -390,6 +594,10 @@ function parseSearchResults(html) {
             return;
         const idMatch = href.match(/[?&]id=(\d+)/);
         const id = idMatch ? idMatch[1] : "";
+        if (id && seen.has(id))
+            return;
+        if (id)
+            seen.add(id);
         const cells = $(row).find("td");
         const descripcion = cells.length > 1 ? normalizeText(cells.eq(1).text()) : "";
         results.push({
@@ -401,6 +609,30 @@ function parseSearchResults(html) {
             resumen: descripcion
         });
     });
+    // Strategy 2: direct link scan (list/div layout)
+    if (results.length === 0) {
+        $("a[href*='verNorma.do']").not("[href*='resaltar']").each((_, el) => {
+            const href = $(el).attr("href") || "";
+            const titulo = normalizeText($(el).text());
+            if (!titulo || titulo.length > 120)
+                return;
+            const idMatch = href.match(/[?&]id=(\d+)/);
+            const id = idMatch ? idMatch[1] : "";
+            if (!id || seen.has(id))
+                return;
+            seen.add(id);
+            // grab surrounding text from closest block parent
+            const block = $(el).closest("li, tr, dd, p, div").first();
+            const allText = normalizeText(block.text());
+            const resumen = allText.replace(titulo, "").trim().slice(0, 200);
+            results.push({
+                id,
+                titulo,
+                enlace: `https://servicios.infoleg.gob.ar/infolegInternet/verNorma.do?id=${id}`,
+                resumen
+            });
+        });
+    }
     return results;
 }
 async function searchCentralSolr(keys) {
@@ -421,79 +653,242 @@ async function searchCentralSolr(keys) {
         });
         const decoder = new TextDecoder("latin1");
         const html = decoder.decode(response.data);
+        assertNotWafPage(html, url);
         return parseSearchResults(html);
     }
     catch (err) {
-        if (isGeoblockError(err)) {
-            const geoblockError = new Error(GEOBLOCK_MSG);
-            geoblockError.isGeoblock = true;
-            throw geoblockError;
+        // Fallback: el WAF de InfoLEG rechaza clientes no-navegador (403 a axios).
+        // Puppeteer presenta huella de Chrome real y suele pasar.
+        try {
+            const html = await fetchWithPuppeteer(url);
+            return parseSearchResults(html);
         }
-        throw err;
+        catch (puppeteerErr) {
+            console.error(`Fallback Puppeteer tambien fallo: ${puppeteerErr.message}`);
+        }
+        throw buildConnectionError(err, url);
     }
 }
-async function fetchWithPuppeteer(url) {
-    const { default: puppeteer } = await import("puppeteer");
+async function fetchWithPuppeteer(url, opts = {}) {
+    let puppeteer;
+    try {
+        ({ default: puppeteer } = await import("puppeteer"));
+    }
+    catch (importErr) {
+        // BUG DETECTADO 10/6/26: puppeteer figura en package.json pero no estaba
+        // instalado -> todos los fallbacks de render fallaban en silencio y el
+        // unico error visible era el 403 del WAF. Hacerlo explicito.
+        throw new Error(`Puppeteer no esta instalado (los fallbacks de render JS no pueden ejecutarse). ` +
+            `Solucion: correr "npm install" en servers/legal-mcp y reiniciar el MCP. Detalle: ${importErr.message}`);
+    }
     const browser = await puppeteer.launch({
         headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled"
+        ]
     });
     try {
         const page = await browser.newPage();
         await page.setUserAgent(OFFICIAL_HEADERS["User-Agent"]);
-        await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+        await page.setExtraHTTPHeaders({ "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8" });
+        const response = await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+        // page.goto NO lanza error ante 403/500: hay que validar el status a mano.
+        // Sin esto, la pagina "Forbidden" del WAF se devolvia como texto de la norma.
+        if (response && !response.ok()) {
+            throw new Error(`Puppeteer recibio HTTP ${response.status()} en ${url}`);
+        }
+        // Para paginas que renderizan contenido por JS (buscador de
+        // argentina.gob.ar) se puede esperar a que aparezca un selector.
+        if (opts.waitForSelector) {
+            await page.waitForSelector(opts.waitForSelector, { timeout: opts.waitTimeout ?? 15000 }).catch(() => { });
+        }
         const html = await page.content();
+        assertNotWafPage(html, url);
+        if (page.url().includes("mostrarArchivoInexistente") || html.includes("No se pudo acceder al archivo")) {
+            const missing = new Error(`InfoLEG no tiene archivo en ${url} (redirigio a "archivo inexistente").`);
+            missing.isMissingFile = true;
+            throw missing;
+        }
         return html;
     }
     finally {
         await browser.close();
     }
 }
-async function fetchCleanText(idNorma, textoHtmlManual) {
+async function fetchInfoLegStaticHtml(url) {
+    const response = await axios.get(url, {
+        httpsAgent,
+        headers: OFFICIAL_HEADERS,
+        responseType: "arraybuffer",
+        maxRedirects: 5
+    });
+    const finalUrl = response.request?.res?.responseUrl || url;
+    const contentType = String(response.headers["content-type"] || "").toLowerCase();
+    const charsetMatch = contentType.match(/charset=([^;]+)/);
+    const charset = charsetMatch ? charsetMatch[1].trim() : "iso-8859-1";
+    const decoder = new TextDecoder(charset.includes("8859") || charset.includes("latin") ? "latin1" : "utf-8");
+    const html = decoder.decode(response.data);
+    if (finalUrl.includes("mostrarArchivoInexistente") || html.includes("No se pudo acceder al archivo")) {
+        const missing = new Error(`InfoLEG no tiene archivo en ${url} (redirigio a "archivo inexistente").`);
+        missing.isMissingFile = true;
+        throw missing;
+    }
+    assertNotWafPage(html, url);
+    return html;
+}
+function absoluteInfoLegUrl(href) {
+    if (!href)
+        return "";
+    if (href.startsWith("http"))
+        return href.replace(/^http:\/\//, "https://");
+    if (href.startsWith("/"))
+        return `https://servicios.infoleg.gob.ar${href}`;
+    return `https://servicios.infoleg.gob.ar/infolegInternet/${href}`;
+}
+// Cuando la URL estatica construida por rango falla, la ficha verNorma.do
+// publica el enlace real al texto (norma.htm / texact.htm). Se usa como
+// resolucion autoritativa.
+async function resolveTextUrlFromVerNorma(idNorma, tipoTexto, fetcher = fetchInfoLegStaticHtml) {
+    const fichaUrl = `https://servicios.infoleg.gob.ar/infolegInternet/verNorma.do?id=${idNorma}`;
+    const html = await fetcher(fichaUrl);
+    const $ = cheerio.load(html);
+    const anexos = [];
+    $("a[href*='/anexos/']").each((_, a) => {
+        const abs = absoluteInfoLegUrl($(a).attr("href") || "");
+        if (abs && (abs.endsWith(".htm") || abs.endsWith(".html")))
+            anexos.push(abs);
+    });
+    if (anexos.length === 0)
+        throw new Error(`La ficha verNorma.do?id=${idNorma} no expone enlaces al texto de la norma.`);
+    const texact = anexos.find((u) => u.includes("texact"));
+    const norma = anexos.find((u) => u.includes("norma.htm"));
+    if (tipoTexto === "original")
+        return norma || texact || anexos[0];
+    return texact || norma || anexos[0];
+}
+// ---------------------------------------------------------------------------
+// FALLBACK argentina.gob.ar: /normativa/nacional/{id}/texto es server-rendered
+// (verificado: Decreto-Ley 1311/56 id 296831 y Ley 27.401 id 296846 completos).
+// Mismo espacio de IDs que InfoLEG y host DISTINTO a servicios.infoleg.gob.ar,
+// por lo que funciona aunque el WAF de InfoLEG haya baneado la IP.
+// Limitacion: publica el texto ORIGINAL; el consolidado vive solo en texact.htm.
+// ---------------------------------------------------------------------------
+export async function fetchTextoFromArgentinaGobAr(idNorma, tipoTexto = "actualizado") {
+    const url = `${ARGENTINA_BASE_URL}/normativa/nacional/${idNorma}/texto`;
+    const html = await fetchOfficialHtml(url);
+    assertNotWafPage(html, url);
+    const $ = cheerio.load(html);
+    const title = normalizeText($("title").text());
+    // Si la norma no tiene texto cargado, el sitio sirve la ficha RESUMEN.
+    if (!/TEXTO/i.test(title)) {
+        throw new Error(`argentina.gob.ar no publica el texto de la norma ${idNorma} (devolvio la ficha resumen).`);
+    }
+    $("script, style, noscript, iframe, nav, header, footer").remove();
+    $(".sidebar, #sidebar, .region-sidebar-first, .region-sidebar-second, .breadcrumb, .pane-share-buttons").remove();
+    const candidates = ["main", "#main-content", ".region-content", "article", "body"];
+    let containerHtml = "";
+    for (const sel of candidates) {
+        const node = $(sel).first();
+        if (node.length && normalizeText(node.text()).length > 400) {
+            containerHtml = $.html(node);
+            break;
+        }
+    }
+    if (!containerHtml)
+        containerHtml = $.html($("body"));
+    let text = cleanInfoLegHtml(containerHtml);
+    // Recortar menues residuales del pie del portal.
+    text = text
+        .replace(/#?\s*Acerca de esta norma[\s\S]*$/i, "")
+        .replace(/##\s*Tr[áa]mites[\s\S]*$/i, "")
+        .trim();
+    if (text.length < 300 || !/ART[IÍ]CULO|DECRETA|RESUELVE|SANCIONAN/i.test(text)) {
+        throw new Error(`El texto extraido de argentina.gob.ar para la norma ${idNorma} no parece un cuerpo normativo valido.`);
+    }
+    let advertencia = "";
+    if (tipoTexto === "actualizado") {
+        advertencia = `argentina.gob.ar publica el TEXTO ORIGINAL de la norma. El texto consolidado/actualizado ` +
+            `no pudo obtenerse de servicios.infoleg.gob.ar. Verifique reformas posteriores en ` +
+            `${ARGENTINA_BASE_URL}/normativa/nacional/${idNorma}/normas-modifican antes de citar articulado.`;
+    }
+    return { text, url, advertencia };
+}
+async function fetchCleanText(idNorma, textoHtmlManual, tipoTexto = "actualizado") {
     if (textoHtmlManual && textoHtmlManual.trim().length > 0) {
         return {
             text: cleanInfoLegHtml(textoHtmlManual),
             url: "Texto de la norma ingresado manualmente por el usuario"
         };
     }
-    if (idNorma) {
-        const targetUrl = getInfoLegStaticUrl(idNorma, "actualizado");
-        const originalUrl = getInfoLegStaticUrl(idNorma, "original");
-        // Intento 1: GET directo
-        for (const url of [targetUrl, originalUrl]) {
-            try {
-                const response = await axios.get(url, { httpsAgent, headers: OFFICIAL_HEADERS });
-                return { text: cleanInfoLegHtml(response.data), url };
-            }
-            catch (err) {
-                if (isGeoblockError(err)) {
-                    const geoblockError = new Error(GEOBLOCK_MSG);
-                    geoblockError.isGeoblock = true;
-                    throw geoblockError;
-                }
-                // otro error: continúa al siguiente URL
-            }
-        }
-        // Intento 2: Puppeteer
-        for (const url of [targetUrl, originalUrl]) {
-            try {
-                const html = await fetchWithPuppeteer(url);
-                return { text: cleanInfoLegHtml(html), url };
-            }
-            catch {
-                // continúa
-            }
-        }
-        throw new Error(`No se pudo obtener el texto de la norma ${idNorma}. El portal de InfoLeg puede estar caído temporalmente.`);
+    if (!idNorma) {
+        throw new Error("Debe indicar el número identificador de la norma ('idNorma') o, en su defecto, pegar el texto de la misma en el campo manual correspondiente.");
     }
-    throw new Error("Debe indicar el número identificador de la norma ('idNorma') o, en su defecto, pegar el texto de la misma en el campo manual correspondiente.");
+    const candidates = tipoTexto === "original"
+        ? [getInfoLegStaticUrl(idNorma, "original"), getInfoLegStaticUrl(idNorma, "actualizado")]
+        : [getInfoLegStaticUrl(idNorma, "actualizado"), getInfoLegStaticUrl(idNorma, "original")];
+    let lastError = null;
+    // Intento 1: URLs estaticas por rango
+    for (const url of candidates) {
+        try {
+            const html = await fetchInfoLegStaticHtml(url);
+            return { text: cleanInfoLegHtml(html), url };
+        }
+        catch (err) {
+            lastError = err;
+        }
+    }
+    // Intento 2: resolver el enlace real desde la ficha verNorma.do
+    try {
+        const realUrl = await resolveTextUrlFromVerNorma(idNorma, tipoTexto);
+        const html = await fetchInfoLegStaticHtml(realUrl);
+        return { text: cleanInfoLegHtml(html), url: realUrl };
+    }
+    catch (err) {
+        lastError = err;
+    }
+    // Intento 3: espejo server-rendered de argentina.gob.ar (host no afectado
+    // por el ban del WAF de servicios.infoleg). Para 'actualizado' devuelve el
+    // original con advertencia explicita; preferimos eso a un error si los
+    // intentos contra servicios.infoleg ya fallaron.
+    try {
+        return await fetchTextoFromArgentinaGobAr(idNorma, tipoTexto);
+    }
+    catch (err) {
+        if (!lastError)
+            lastError = err;
+    }
+    // Intento 4: Puppeteer sobre las URLs estaticas (pasa el WAF con huella de Chrome real)
+    for (const url of candidates) {
+        try {
+            const html = await fetchWithPuppeteer(url);
+            return { text: cleanInfoLegHtml(html), url };
+        }
+        catch {
+            // continúa
+        }
+    }
+    // Intento 5: resolver la ficha verNorma.do y descargar el texto, todo via Puppeteer
+    try {
+        const realUrl = await resolveTextUrlFromVerNorma(idNorma, tipoTexto, fetchWithPuppeteer);
+        const html = await fetchWithPuppeteer(realUrl);
+        return { text: cleanInfoLegHtml(html), url: realUrl };
+    }
+    catch (err) {
+        lastError = err;
+    }
+    throw buildConnectionError(lastError, candidates[0]);
 }
 export function extractTeleologicalJustification(text) {
     const lines = text.split("\n");
     let extracting = false;
     let resultLines = [];
-    const startRegex = /^\s*(vistos?|considerando(s)?)\\b/i;
-    const endRegex = /^\s*(el\s+.*?(decreta|resuelve|dispone|sanciona)|por\s+ello,?)\\b/i;
+    // Fix: las regex anteriores usaban \\b (backslash literal + "b") y nunca
+    // matcheaban limite de palabra.
+    const startRegex = /^\s*(vistos?|considerando(s)?)\b/i;
+    const endRegex = /^\s*(el\s+.*?(decreta|resuelve|dispone|sanciona)|por\s+ello,?)\b/i;
     for (const line of lines) {
         const trimmed = line.trim();
         if (startRegex.test(trimmed)) {
@@ -660,9 +1055,22 @@ export function registerAllTools(server) {
             if (args.anioNorma)
                 searchQuery += ` ${args.anioNorma}`;
             console.error(`Searching InfoLEG Central Index for: "${searchQuery}"`);
-            const searchResults = await searchCentralSolr(searchQuery);
-            let finalResults = searchResults;
-            if (searchResults.length === 0) {
+            // Intento 1: buscador clasico de servicios.infoleg.gob.ar (responde desde cualquier IP)
+            let solrResults = [];
+            let solrFailed = false;
+            let solrError = null;
+            try {
+                solrResults = await searchCentralSolr(searchQuery);
+            } catch (_solrErr) {
+                solrFailed = true;
+                solrError = _solrErr;
+                console.error(`InfoLEG buscarNormas.do falló (${_solrErr.message}), intentando argentina.gob.ar`);
+            }
+            let finalResults = solrResults;
+            // Intento 2: argentina.gob.ar (searchNormativaOfficial ahora renderiza
+            // la pagina con Puppeteer cuando el HTML estatico viene vacio, asi que
+            // este fallback funciona aunque el WAF de servicios.infoleg banee la IP)
+            if (solrFailed || solrResults.length === 0) {
                 try {
                     const modernParams = {
                         texto: args.criterio,
@@ -679,15 +1087,25 @@ export function registerAllTools(server) {
                         resumen: r.organismo ? `${r.organismo} - ${r.descripcion || ''}` : r.descripcion || ''
                     }));
                 } catch (_fallbackErr) {
-                    // si el fallback también falla, devolver sin resultados
+                    // conservar la causa del fallback para reportarla junto al error principal
+                    var fallbackError = _fallbackErr;
                 }
             }
             if (finalResults.length === 0) {
+                // Si la fuente principal fallo por conexion, reportar el error real
+                // en lugar de un falso "sin resultados".
+                if (solrFailed && solrError) {
+                    let msg = solrError.message;
+                    if (typeof fallbackError !== "undefined" && fallbackError) {
+                        msg += `\n\n**Fallback argentina.gob.ar:** ${fallbackError.message}`;
+                    }
+                    return { content: [{ type: "text", text: msg }], isError: true };
+                }
                 return {
                     content: [{
                             type: "text",
                             text: `No se encontraron resultados de InfoLEG para el criterio "${args.criterio}".\n\n` +
-                                `💡 Tip: Si tenés el ID directo de la ley o decreto, podés llamar directamente a "obtener_texto_norma" con ese ID (ej: "296831" para la Ley 27430).`
+                                `💡 Tip: Si tenés el ID directo de la ley o decreto, podés llamar directamente a "obtener_texto_norma" con ese ID.`
                         }]
                 };
             }
@@ -743,12 +1161,14 @@ export function registerAllTools(server) {
         const targetUrl = getInfoLegStaticUrl(idNorma, tipoTexto);
         console.error(`Fetching InfoLEG Static Text from: ${targetUrl}`);
         try {
-            const { text: cleanText, url: fetchedUrl } = await fetchCleanText(idNorma);
+            const { text: cleanText, url: fetchedUrl, advertencia } = await fetchCleanText(idNorma, undefined, tipoTexto);
             let output = `# Texto de la Norma (InfoLEG)\n\n`;
             output += `* **ID de la Norma:** \`${idNorma}\`\n`;
             output += `* **Variante:** \`${tipoTexto.toUpperCase()}\`\n`;
-            output += `* **Fuente Oficial:** [Enlace de descarga](${fetchedUrl})\n\n`;
-            output += `## Cuerpo Normativo\n\n${cleanText}`;
+            output += `* **Fuente Oficial:** [Enlace de descarga](${fetchedUrl})\n`;
+            if (advertencia)
+                output += `\n> ⚠️ **Advertencia:** ${advertencia}\n`;
+            output += `\n## Cuerpo Normativo\n\n${cleanText}`;
             return { content: [{ type: "text", text: output }] };
         }
         catch (error) {
@@ -760,7 +1180,7 @@ export function registerAllTools(server) {
                 content: [{
                         type: "text",
                         text: `⚠️ **No se pudo obtener el texto automáticamente.**\n\n` +
-                            `El portal de InfoLEG está temporalmente inaccesible.\n\n` +
+                            `**Detalle:** ${error.message}\n\n` +
                             `Podés copiar el texto manualmente desde: [${fallbackUrl}](${fallbackUrl}) y pegarlo en el campo \`textoHtmlManual\`.`
                     }],
                 isError: true
@@ -773,9 +1193,11 @@ export function registerAllTools(server) {
             `- **Nombre del Servidor:** \`infoleg-mcp\`\n` +
             `- **Fuente Primaria:** Portal de Información Legislativa (Ministerio de Justicia de la Nación Argentina).\n` +
             `- **Cobertura:** Leyes Nacionales, Decretos de Necesidad y Urgencia (DNU), Resoluciones, Disposiciones y actos administrativos nacionales.\n\n` +
-            `## Requisito de IP\n` +
-            `- Este conector requiere **IP argentina** para acceder a servicios.infoleg.gob.ar. Funciona correctamente desde Claude Desktop instalado en Argentina.\n` +
-            `- Desde entornos cloud (claude.ai, servidores externos) el portal bloquea el acceso. En ese caso, usá el campo \`textoHtmlManual\` para procesar texto copiado manualmente.\n\n` +
+            `## Conectividad\n` +
+            `- servicios.infoleg.gob.ar responde desde cualquier IP (no hay geoblock). Si una consulta falla, el error reportado incluye el detalle real (HTTP, codigo, respuesta).\n` +
+            `- **Fallback automatico:** si servicios.infoleg.gob.ar esta bloqueado (ej. ban del WAF a la IP), el texto y los metadatos se obtienen del espejo server-rendered de argentina.gob.ar/normativa (mismo espacio de IDs). En ese caso el texto disponible es el ORIGINAL y se advierte que las reformas deben verificarse en /normas-modifican.\n` +
+            `- **Busquedas:** el buscador de argentina.gob.ar renderiza resultados por JS; el conector lo renderiza con Puppeteer cuando el HTML estatico viene vacio.\n` +
+            `- En entornos que filtran la salida de red (allowlist de hosts) el conector puede quedar bloqueado; en ese caso usa el campo \`textoHtmlManual\` para procesar texto copiado manualmente.\n\n` +
             `## Capacidades Destacadas\n` +
             `1. **Selección de Variante:** Descarga y limpia el texto original o el texto consolidado actualizado.\n` +
             `2. **Rutas directas oficiales:** Genera automáticamente la ubicación del archivo en el portal del Estado.\n` +

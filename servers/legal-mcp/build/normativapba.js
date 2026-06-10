@@ -31,8 +31,15 @@ server.tool("buscar_normativa", "Busca normativas de la Provincia de Buenos Aire
             params.append("q[phrase]", args.frase_exacta);
         if (args.palabras_clave)
             params.append("q[with_some_words]", args.palabras_clave);
-        if (args.tipo_norma)
-            params.append("q[terms][raw_type]", args.tipo_norma);
+        // FIX: q[terms][raw_type] esta roto en el sitio (verificado 10/6/26:
+        // 'ley', 'Ley' y 'LEY' devuelven 0 aunque haya miles de leyes; el indice
+        // no matchea ningun valor). En cambio q[terms][number] y [year] funcionan.
+        // El tipo se filtra localmente por el slug del enlace (/ar-b/{tipo}/...).
+        const tipoSlug = args.tipo_norma
+            ? args.tipo_norma.toLowerCase()
+                .normalize("NFD").replace(/[̀-ͯ]/g, "")
+                .trim().replace(/[\s_]+/g, "-")
+            : null;
         if (args.numero)
             params.append("q[terms][number]", args.numero);
         if (args.anio)
@@ -87,12 +94,21 @@ server.tool("buscar_normativa", "Busca normativas de la Provincia de Buenos Aire
                 });
             }
         });
-        let content = `**Búsqueda ejecutada en el origen:** ${url}\n**Estado:** ${pageInfo}\n\n`;
-        if (resultados.length === 0) {
-            content += "No se encontraron normativas con los parámetros especificados. Prueba ampliando la búsqueda o usando 'palabras_clave' en lugar de 'frase_exacta'.";
+        let filtrados = resultados;
+        if (tipoSlug) {
+            filtrados = resultados.filter(r => r.enlace.includes(`/ar-b/${tipoSlug}/`));
+        }
+        let content = `**Búsqueda ejecutada en el origen:** ${url}\n**Estado:** ${pageInfo}\n`;
+        if (tipoSlug)
+            content += `**Filtro de tipo:** '${tipoSlug}' aplicado localmente sobre esta página de resultados (${filtrados.length} de ${resultados.length}). Si necesitás más, avanzá con 'pagina'.\n`;
+        content += `\n`;
+        if (filtrados.length === 0) {
+            content += tipoSlug && resultados.length > 0
+                ? `Esta página no contiene normas de tipo '${tipoSlug}'. Probá con 'pagina' siguiente o quitá el filtro de tipo.`
+                : "No se encontraron normativas con los parámetros especificados. Prueba ampliando la búsqueda o usando 'palabras_clave' en lugar de 'frase_exacta'.";
         }
         else {
-            resultados.forEach((r, idx) => {
+            filtrados.forEach((r, idx) => {
                 content += `### ${idx + 1}. ${r.titulo}\n`;
                 content += `- **Enlace:** ${r.enlace}\n`;
                 content += `- **Publicación:** ${r.fecha_publicacion}\n`;
@@ -935,24 +951,28 @@ server.tool("mapa_normativo_tema", "Construye un árbol jerárquico completo de 
             'Resoluciones Ministeriales': [],
             'Disposiciones / Circulares': []
         };
-        const fetchPorTipo = async (tipo) => {
+        // FIX (verificado 10/6/26): el filtro server-side q[terms][raw_type] esta
+        // ROTO en normas.gba.gob.ar: devuelve 0 con cualquier valor ('ley', 'Ley',
+        // 'LEY'), aunque q[terms][number] y [year] funcionan. Estrategia nueva:
+        // busqueda SIN filtro de tipo (funciona: "educación" = 10.292 hits) y
+        // clasificacion local por el slug del enlace (/ar-b/{tipo}/...). Se
+        // recorren hasta 4 paginas o hasta juntar 5 normas por jerarquia.
+        const fetchPagina = async (modo, page) => {
             const params = new URLSearchParams();
-            params.append("q[phrase]", args.tema);
-            params.append("q[terms][raw_type]", tipo);
+            params.append(modo === "phrase" ? "q[phrase]" : "q[with_some_words]", args.tema);
+            params.append("page", String(page));
             const url = `${BASE_URL}/resultados?${params.toString()}`;
             const response = await axios.get(url, { httpsAgent, headers: { 'User-Agent': 'Mozilla/5.0' } });
             const $ = cheerio.load(response.data);
             const resultados = [];
-            $('.card').each((i, el) => {
-                if (i >= 5)
-                    return; // Top 5 de cada jerarquía es suficiente para un mapa inicial
+            $('.card').each((_, el) => {
                 const title = $(el).find('a').text().trim().replace(/\s+/g, ' ');
                 const link = $(el).find('a').attr('href');
                 let fecha = 'Sin fecha';
                 const fechaMatch = $(el).text().match(/Fecha de publicación:\s*([\d\/]+)/);
                 if (fechaMatch)
                     fecha = fechaMatch[1];
-                if (title && link) {
+                if (title && link && link.includes('/ar-b/')) {
                     resultados.push({
                         titulo: title,
                         fecha: fecha,
@@ -962,19 +982,44 @@ server.tool("mapa_normativo_tema", "Construye un árbol jerárquico completo de 
             });
             return resultados;
         };
-        // Ejecución paralela
-        const [leyes, decretos, resoluciones, disposiciones] = await Promise.all([
-            fetchPorTipo('ley'),
-            fetchPorTipo('decreto'),
-            fetchPorTipo('resolucion'),
-            fetchPorTipo('disposicion')
-        ]);
-        mapa['Leyes Generales'] = leyes;
-        mapa['Decretos Reglamentarios / Ejecutivos'] = decretos;
-        mapa['Resoluciones Ministeriales'] = resoluciones;
-        mapa['Disposiciones / Circulares'] = disposiciones;
+        const TOPE = 5;
+        const clasificar = (item) => {
+            const m = item.enlace.match(/\/ar-b\/([a-z-]+)\//i);
+            const slug = m ? m[1].toLowerCase() : "";
+            if (slug === "ley" || slug === "decreto-ley")
+                return 'Leyes Generales';
+            if (slug === "decreto")
+                return 'Decretos Reglamentarios / Ejecutivos';
+            if (slug.startsWith("resolucion"))
+                return 'Resoluciones Ministeriales';
+            if (slug === "disposicion" || slug.startsWith("ordenanza") || slug === "circular")
+                return 'Disposiciones / Circulares';
+            return null;
+        };
+        const llenarMapa = async (modo) => {
+            Object.keys(mapa).forEach(k => { mapa[k] = []; });
+            for (let page = 1; page <= 4; page++) {
+                const items = await fetchPagina(modo, page);
+                if (items.length === 0)
+                    break;
+                for (const item of items) {
+                    const bucket = clasificar(item);
+                    if (bucket && mapa[bucket].length < TOPE)
+                        mapa[bucket].push(item);
+                }
+                if (Object.values(mapa).every(arr => arr.length >= TOPE))
+                    break;
+            }
+            return Object.values(mapa).reduce((acc, arr) => acc + arr.length, 0);
+        };
+        let modoUsado = "frase exacta";
+        let totalMapa = await llenarMapa("phrase");
+        if (totalMapa === 0) {
+            totalMapa = await llenarMapa("words");
+            modoUsado = "palabras clave (la frase exacta no arrojó resultados)";
+        }
         let content = `# Mapa Normativo: ${args.tema}\n`;
-        content += `> Árbol jerárquico de normativas (textos literales, sin recortes). Búsqueda exacta de frase.\n\n`;
+        content += `> Árbol jerárquico de normativas (textos literales, sin recortes). Modo de búsqueda: ${modoUsado}.\n\n`;
         let isEmpty = true;
         for (const [categoria, normas] of Object.entries(mapa)) {
             if (normas.length > 0) {

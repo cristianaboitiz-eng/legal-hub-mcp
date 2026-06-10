@@ -4,10 +4,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import axios from "axios";
 import * as cheerio from "cheerio";
-import https from "https";
-const httpsAgent = new https.Agent({
-    rejectUnauthorized: false
-});
+import { installTlsFallback } from "./tls-fallback.js";
+installTlsFallback(axios, "bora");
 // Zod schemas with adaptive coercion
 export const stringOrNumber = z.union([z.string(), z.number()]).transform(val => String(val));
 export const stringOrNumberOptional = z.union([z.string(), z.number()]).transform(val => String(val)).optional();
@@ -182,7 +180,6 @@ export async function buscarAvisos(args) {
     formData.append("params", JSON.stringify(searchParams));
     formData.append("array_volver", "[]");
     const response = await axios.post(url, formData, {
-        httpsAgent,
         headers: {
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -250,7 +247,6 @@ export async function obtenerDetalleAviso(args) {
     const normalizedFecha = normalizeDateToYYYYMMDD(args.fecha);
     const url = `https://www.boletinoficial.gob.ar/detalleAviso/${args.seccion}/${args.idAviso}/${normalizedFecha}`;
     const response = await axios.get(url, {
-        httpsAgent,
         headers: {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -286,7 +282,6 @@ export async function obtenerSumarioSeccion(args) {
     const fecha = normalizeDateToYYYYMMDD(fechaRaw);
     const url = `https://www.boletinoficial.gob.ar/seccion/${args.seccion}/${fecha}`;
     const response = await axios.get(url, {
-        httpsAgent,
         headers: {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -402,7 +397,6 @@ export async function buscarLicitacionesPublicas(args) {
 export async function obtenerPortada() {
     const url = "https://www.boletinoficial.gob.ar/";
     const response = await axios.get(url, {
-        httpsAgent,
         headers: {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -798,60 +792,89 @@ Este servidor es un puente automatizado de información pública legal y no cons
         }
     });
     // Tool 9: obtener_sumario_del_dia
-    server.tool("obtener_sumario_del_dia", "Obtiene el sumario completo y unificado de las cuatro secciones del Boletín Oficial para un día dado, agrupado por rubros.", {
-        fecha: stringOrNumberOptional.describe("Fecha a consultar en formato YYYYMMDD (ej. '20171229'). Si se omite, se asume la fecha de hoy en Argentina.")
+    server.tool("obtener_sumario_del_dia", "Obtiene el sumario completo y unificado de las cuatro secciones del Boletín Oficial para un día dado, agrupado por rubros. Paginado: use 'pagina' e 'items_por_pagina' para recorrer ediciones extensas.", {
+        fecha: stringOrNumberOptional.describe("Fecha a consultar en formato YYYYMMDD (ej. '20171229'). Si se omite, se asume la fecha de hoy en Argentina."),
+        seccion: z.string().optional().describe("Limitar a una sección ('primera', 'segunda', 'tercera', 'cuarta'). Si se omite, incluye las cuatro."),
+        pagina: z.number().optional().describe("Página de resultados (por defecto 1)."),
+        items_por_pagina: z.number().optional().describe("Items por página (por defecto 50, máximo 200).")
     }, async (args) => {
         try {
             const sumario = await obtenerSumarioDelDia(args);
+            // FIX: la edicion completa superaba el limite de tokens (89KB+)
+            // y se truncaba sin aviso. Ahora se aplana, se pagina y se informa
+            // el total y la pagina siguiente.
+            const pagina = Math.max(1, Number(args.pagina) || 1);
+            const porPagina = Math.min(200, Math.max(1, Number(args.items_por_pagina) || 50));
+            const filtroSeccion = args.seccion ? String(args.seccion).toLowerCase() : null;
             let md = `# 🏛️ Boletín Oficial - Sumario Unificado del Día\n\n`;
             const yyyymmdd = sumario.fecha;
             const formattedDate = `${yyyymmdd.substring(6, 8)}/${yyyymmdd.substring(4, 6)}/${yyyymmdd.substring(0, 4)}`;
             md += `*   **Fecha de Edición:** ${formattedDate}\n\n`;
-            md += `--- \n\n`;
-            let totalItems = 0;
-            sumario.resultados.forEach((res) => {
-                totalItems += res.items.length;
+            const resultados = filtroSeccion
+                ? sumario.resultados.filter((r) => r.seccion.toLowerCase().includes(filtroSeccion))
+                : sumario.resultados;
+            const flat = [];
+            const erroresSeccion = [];
+            const urlPorSeccion = {};
+            resultados.forEach((res) => {
+                urlPorSeccion[res.seccion] = res.url;
+                if (res.error) erroresSeccion.push({ seccion: res.seccion, error: res.error });
+                res.items.forEach((item) => flat.push({ seccion: res.seccion, item }));
             });
+            const totalItems = flat.length;
             if (totalItems === 0) {
+                const detalleErrores = erroresSeccion.length
+                    ? `\n\nErrores por sección:\n${erroresSeccion.map(e => `- ${e.seccion}: ${e.error}`).join('\n')}`
+                    : '';
                 return {
                     content: [{
                             type: "text",
-                            text: `No se encontraron avisos en ninguna de las secciones para la fecha ${formattedDate}.`
+                            text: `No se encontraron avisos${filtroSeccion ? ` en la sección "${filtroSeccion}"` : " en ninguna de las secciones"} para la fecha ${formattedDate}.${detalleErrores}`
                         }]
                 };
             }
-            sumario.resultados.forEach((res) => {
-                md += `## 📂 SECCIÓN: ${res.seccion.toUpperCase()}\n`;
-                md += `*URL Oficial: [Ver Sección en BORA](${res.url})*\n\n`;
-                if (res.error) {
-                    md += `⚠️ *Error al cargar esta sección: ${res.error}*\n\n`;
-                }
-                else if (res.items.length === 0) {
-                    md += `*No se registraron publicaciones para esta sección hoy.*\n\n`;
-                }
-                else {
-                    // Group items by Rubro
-                    const grouped = {};
-                    res.items.forEach((item) => {
-                        if (!grouped[item.rubro])
-                            grouped[item.rubro] = [];
-                        grouped[item.rubro].push(item);
+            const totalPaginas = Math.ceil(totalItems / porPagina);
+            const desde = (pagina - 1) * porPagina;
+            const slice = flat.slice(desde, desde + porPagina);
+            md += `*   **Total de avisos:** ${totalItems}${filtroSeccion ? ` (sección ${filtroSeccion})` : ''}\n`;
+            md += `*   **Página:** ${pagina} de ${totalPaginas} (mostrando ${slice.length} avisos, items ${desde + 1}-${desde + slice.length})\n`;
+            if (pagina < totalPaginas) {
+                md += `*   **Siguiente:** repetir la llamada con \`pagina: ${pagina + 1}\`\n`;
+            }
+            md += `\n--- \n\n`;
+            erroresSeccion.forEach((e) => {
+                md += `⚠️ *Error al cargar la sección ${e.seccion}: ${e.error}*\n\n`;
+            });
+            if (slice.length === 0) {
+                md += `*La página solicitada está fuera de rango (total: ${totalPaginas} páginas).*\n`;
+                return { content: [{ type: "text", text: md }] };
+            }
+            // Agrupar el slice por seccion -> rubro preservando el orden
+            const porSeccion = new Map();
+            slice.forEach(({ seccion, item }) => {
+                if (!porSeccion.has(seccion)) porSeccion.set(seccion, new Map());
+                const rubros = porSeccion.get(seccion);
+                const rubro = item.rubro || 'Sin rubro';
+                if (!rubros.has(rubro)) rubros.set(rubro, []);
+                rubros.get(rubro).push(item);
+            });
+            for (const [seccion, rubros] of porSeccion) {
+                md += `## 📂 SECCIÓN: ${seccion.toUpperCase()}\n`;
+                if (urlPorSeccion[seccion]) md += `*URL Oficial: [Ver Sección en BORA](${urlPorSeccion[seccion]})*\n\n`;
+                for (const [rubro, items] of rubros) {
+                    md += `### 🗂️ Rubro: ${rubro}\n\n`;
+                    items.forEach((item) => {
+                        md += `*   **📄 ${item.titulo || "Aviso Oficial"}**\n`;
+                        if (item.norma)
+                            md += `    *   **Norma:** ${item.norma}\n`;
+                        if (item.extracto)
+                            md += `    *   **Síntesis:** *${item.extracto}*\n`;
+                        md += `    *   **Referencias:** ID \`${item.idAviso}\` | [Texto Completo](${item.urlDetalle}) | [Ver PDF](${item.urlPdf})\n`;
                     });
-                    Object.keys(grouped).forEach(rubro => {
-                        md += `### 🗂️ Rubro: ${rubro}\n\n`;
-                        grouped[rubro].forEach((item) => {
-                            md += `*   **📄 ${item.titulo || "Aviso Oficial"}**\n`;
-                            if (item.norma)
-                                md += `    *   **Norma:** ${item.norma}\n`;
-                            if (item.extracto)
-                                md += `    *   **Síntesis:** *${item.extracto}*\n`;
-                            md += `    *   **Referencias:** ID \`${item.idAviso}\` | [Texto Completo](${item.urlDetalle}) | [Ver PDF](${item.urlPdf})\n`;
-                        });
-                        md += `\n`;
-                    });
+                    md += `\n`;
                 }
                 md += `--- \n\n`;
-            });
+            }
             return { content: [{ type: "text", text: md }] };
         }
         catch (error) {

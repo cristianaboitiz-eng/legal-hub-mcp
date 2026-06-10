@@ -7,7 +7,6 @@ import { z } from "zod";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import https from "https";
 import { fileURLToPath } from "url";
 import { installTlsFallback } from "./tls-fallback.js";
 
@@ -18,7 +17,7 @@ const __dirname = path.dirname(__filename);
 
 const axiosClient = axios.create();
 // TLS estricto por defecto; fallback inseguro solo ante cert roto (ver tls-fallback.js).
-const httpsAgent = installTlsFallback(axiosClient, "bopba");
+installTlsFallback(axiosClient, "bopba");
 // Tasas updater functions
 const PDF_URL = 'https://tasador.boletinoficial.gba.gob.ar/pdfs/Flyer%20Tasas%20BO.pdf';
 const CACHE_FILE = path.join(__dirname, '../data/tasas-cache.json');
@@ -234,8 +233,11 @@ async function getTasasData(forceUpdate = false) {
     }
     console.log('Parsing PDF...');
     const { PDFParse } = await import("pdf-parse");
-    const parser = new PDFParse();
-    const pdfData = await parser.parse(pdfBuffer);
+    // FIX API pdf-parse v2: el constructor recibe { data }, el metodo es getText().
+    // new PDFParse() sin opciones crasheaba en pdfjs: "Cannot read properties
+    // of undefined (reading 'verbosity')".
+    const parser = new PDFParse({ data: new Uint8Array(pdfBuffer) });
+    const pdfData = await parser.getText();
     const tasas = parseTasasFromPDF(pdfData.text);
     const tasasData = {
         version: new Date().toISOString(),
@@ -376,8 +378,9 @@ export const registerAllTools = (server) => {
             });
             // @ts-ignore
             const { PDFParse } = await import("pdf-parse");
-            const parser = new PDFParse();
-            const pdfData = await parser.parse(Buffer.from(response.data));
+            // FIX API pdf-parse v2: { data } en el constructor + getText().
+            const parser = new PDFParse({ data: new Uint8Array(response.data) });
+            const pdfData = await parser.getText();
             return {
                 content: [{ type: "text", text: pdfData.text.substring(0, 50000) }],
             };
@@ -795,17 +798,52 @@ export const registerAllTools = (server) => {
                 },
             });
             const $ = cheerio.load(response.data);
-            const title = $('h1, h2, h3').first().text().trim();
+            // FIX: la pagina /ver renderiza por JS -> los selectores originales
+            // devolvian titulo y link_descargar vacios. Ampliamos selectores y,
+            // como la URL de descarga es deterministica (misma convencion que
+            // descargar_seccion), la construimos siempre.
+            const title = $('h1, h2, h3').first().text().trim()
+                || $('meta[property="og:title"]').attr('content')?.trim()
+                || $('title').text().replace(/\s*[|\-–]\s*Bolet[ií]n Oficial.*$/i, '').trim()
+                || '';
             const downloadLink = $('a[href*="/descargar"]').attr('href');
-            const contentText = $('.content, .section-content').first().text().replace(/\s+/g, ' ').trim().substring(0, 1000);
+            const downloadUrl = downloadLink
+                ? `https://boletinoficial.gba.gob.ar${downloadLink}`
+                : `https://boletinoficial.gba.gob.ar/secciones/${id}/descargar`;
+            let contentText = $('.content, .section-content, main, article').first().text().replace(/\s+/g, ' ').trim().substring(0, 1000);
+            let tituloFinal = title;
+            // Si el HTML no aporta vista previa, la extraemos del PDF directamente.
+            if (!contentText) {
+                try {
+                    const pdfResp = await axiosClient.get(downloadUrl, {
+                        responseType: 'arraybuffer',
+                        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+                        timeout: 30000,
+                    });
+                    const { PDFParse } = await import("pdf-parse");
+                    const parser = new PDFParse({ data: new Uint8Array(pdfResp.data) });
+                    const pdfData = await parser.getText({ partial: [1] });
+                    const pdfText = (pdfData.text || '').replace(/\s+/g, ' ').trim();
+                    if (pdfText) {
+                        contentText = pdfText.substring(0, 1000);
+                        if (!tituloFinal) {
+                            // Primera linea significativa del PDF como titulo aproximado
+                            tituloFinal = pdfText.split(/(?<=[.:])\s/)[0].substring(0, 120);
+                        }
+                    }
+                }
+                catch {
+                    // PDF no disponible: se informa abajo
+                }
+            }
             return {
                 content: [{
                         type: "text",
                         text: JSON.stringify({
                             id,
-                            titulo: title,
+                            titulo: tituloFinal,
                             link_ver: url,
-                            link_descargar: downloadLink ? `https://boletinoficial.gba.gob.ar${downloadLink}` : '',
+                            link_descargar: downloadUrl,
                             contenido_previo: contentText || "Contenido no disponible en vista previa. Use descargar_seccion para obtener el PDF completo."
                         }, null, 2)
                     }],
@@ -1151,19 +1189,33 @@ export const registerAllTools = (server) => {
                     timeout: 30000
                 });
                 const { PDFParse } = await import("pdf-parse");
-                const parser = new PDFParse();
-                const pdfData = await parser.parse(Buffer.from(response.data));
+                // FIX API pdf-parse v2: { data } en el constructor + getText().
+                const parser = new PDFParse({ data: new Uint8Array(response.data) });
+                const pdfData = await parser.getText();
                 text = pdfData.text;
             }
+            // FIX FALSOS NEGATIVOS (mismos bugs que PTN::detector_plazos_dictamenes):
+            // flag /g con .test() reutilizado (lastIndex sucio), "días" exigia
+            // espacio posterior, y faltaban los formatos reales de edictos:
+            // "treinta (30) días", plazos en letras, "contados desde", "bajo
+            // apercibimiento", "perentorio".
+            const NUM_LETRAS = "(?:un[oa]?|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|quince|veinte|treinta|cuarenta\\s+y\\s+cinco|cuarenta|cincuenta|sesenta|noventa|ciento\\s+veinte|ciento\\s+ochenta)";
+            const UNIDAD = "(?:d[ií]as?|mes(?:es)?|a[ñn]os?|horas?|semanas?)";
+            const CALIF = "(?:\\s+(?:h[áa]biles?|corridos?|laborables?|administrativos?|judiciales?))?";
             const patterns = [
-                { regex: /\b\d+\s+(días?\s+(habiles|corridos)?|meses|años?)\b/i, name: "Plazo numérico" },
-                { regex: /\b(plazo|término)\s+de\s+(días?|meses|años?)\b/i, name: "Cláusula de plazo" },
-                { regex: /\b(prescribe|prescripción)\b/i, name: "Prescripción" },
-                { regex: /\b(caduca|caducidad)\b/i, name: "Caducidad" },
-                { regex: /\b(vencimiento|mora)\b/i, name: "Vencimiento/Mora" },
-                { regex: /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/g, name: "Fecha específica" },
-                { regex: /\b(hasta\s+el\s+(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|el\s+día\s+\d+))/i, name: "Fecha límite" },
-                { regex: /\b(dentro\s+de\s+(?:los\s+)?\d+\s+(días?|meses|años?))\b/i, name: "Plazo desde publicación" },
+                { regex: new RegExp(`\\b(?:\\d+|${NUM_LETRAS})\\s*(?:\\(\\s*\\d+\\s*\\)\\s*)?${UNIDAD}${CALIF}`, "i"), name: "Plazo numérico" },
+                { regex: /\b(?:plazo|t[ée]rmino)s?\s+(?:m[áa]ximo\s+|m[íi]nimo\s+|perentorio\s+)?de\b/i, name: "Cláusula de plazo" },
+                { regex: new RegExp(`\\bdentro\\s+de(?:l\\s+(?:plazo|t[ée]rmino)|\\s+l[oa]s?\\s+(?:\\d+|${NUM_LETRAS}))`, "i"), name: "Plazo desde publicación" },
+                { regex: /\b(?:contad[oa]s?\s+(?:desde|a\s+partir)|a\s+partir\s+de\s+(?:la\s+)?(?:notificaci[óo]n|publicaci[óo]n|recepci[óo]n|fecha))/i, name: "Cómputo de plazo" },
+                { regex: /\b(?:prescrib\w+|prescripci[óo]n|prescript\w+)\b/i, name: "Prescripción" },
+                { regex: /\bcaduc\w+\b/i, name: "Caducidad" },
+                { regex: /\b(?:perentori[oa]s?|improrrogables?|fatal(?:es)?)\b/i, name: "Plazo perentorio" },
+                { regex: /\b(?:venc\w+|expir\w+|\bmora\b)/i, name: "Vencimiento/Mora" },
+                { regex: /\bbajo\s+apercibimiento\b/i, name: "Apercibimiento" },
+                { regex: /\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/, name: "Fecha específica" },
+                { regex: /\b\d{1,2}[°º]?\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)(?:\s+de\s+\d{4})?\b/i, name: "Fecha en letras" },
+                { regex: /\bhasta\s+el\s+(?:d[íi]a\s+)?\d/i, name: "Fecha límite" },
+                { regex: /\b(?:antes\s+del?\b|a\s+m[áa]s\s+tardar)/i, name: "Fecha límite" },
             ];
             const paragraphs = text.split(/\n\n+/);
             const results = [];
@@ -1172,7 +1224,8 @@ export const registerAllTools = (server) => {
                 if (!trimmed || trimmed.length < 10) continue;
                 const foundMatches = [];
                 for (const pattern of patterns) {
-                    if (pattern.regex.test(trimmed)) foundMatches.push(pattern.name);
+                    pattern.regex.lastIndex = 0;
+                    if (pattern.regex.test(trimmed) && !foundMatches.includes(pattern.name)) foundMatches.push(pattern.name);
                 }
                 if (foundMatches.length > 0) {
                     results.push({
