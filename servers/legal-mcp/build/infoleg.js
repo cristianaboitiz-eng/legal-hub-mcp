@@ -280,25 +280,103 @@ function parseNormativaListHtml(html, opts = {}) {
     }
     return { countText, results };
 }
+// -----------------------------------------------------------------------------
+// PROTOCOLO REAL DEL BUSCADOR (descifrado 10/6/26 desde el HTML crudo del form):
+// <form class="infoleg-search-form" action="/normativa?..." method="POST">.
+// Los resultados se renderizan server-side SOLO en la respuesta del POST; todo
+// GET devuelve el formulario vacio (por eso el parser veia siempre 0 y no hay
+// ningun XHR que interceptar). Flujo: GET para obtener form_build_id fresco ->
+// POST con los campos del form. El campo "tarro_de_miel" es un honeypot
+// anti-bot y DEBE ir vacio. El form NO tiene captcha. Paginacion via
+// querystring (limit/offset) del action.
+// -----------------------------------------------------------------------------
+async function searchNormativaViaPost(params) {
+    const formHtml = await fetchOfficialHtml(`${ARGENTINA_BASE_URL}/normativa`);
+    const fbid = formHtml.match(/name="form_build_id" value="([^"]+)"/)?.[1];
+    if (!fbid)
+        throw new Error("No se pudo extraer form_build_id del formulario de normativa.");
+    const url = buildNormativaSearchUrl(params);
+    const tipoSlug = params.tipoNorma ? (normalizeTipoNorma(params.tipoNorma) || params.tipoNorma) : "";
+    // REGLA DEL FORM (unsetSancionEnTipoNormaLey.js + ley_route="leyes"): cuando
+    // el tipo es "leyes" el formulario deshabilita y vacia el campo anio.
+    // Enviarlo igual hace que el server devuelva 0 (verificado: Ley 27430 +
+    // anio 2017 -> 0; sin anio -> resultado correcto).
+    const anioEfectivo = tipoSlug === "leyes" ? "" : (params.anioNorma || "");
+    if (tipoSlug === "leyes" && params.anioNorma)
+        console.error(`tipo "leyes": se omite anio=${params.anioNorma} (el buscador oficial no admite anio para leyes; filtre por numero).`);
+    // Dependencia: el select exige el nombre registrado EXACTO. Si lo recibido
+    // no coincide, se busca la opcion real que lo contenga (insensible a
+    // mayusculas y tildes), ej. "Ministerio de Trabajo" -> "MINISTERIO DE
+    // TRABAJO, EMPLEO Y SEGURIDAD SOCIAL".
+    let dependenciaEfectiva = params.dependencia || "";
+    if (dependenciaEfectiva) {
+        const selMatch = formHtml.match(/<select[^>]*name="dependencia"[\s\S]*?<\/select>/);
+        if (selMatch) {
+            const opciones = [...selMatch[0].matchAll(/<option[^>]*value="([^"]*)"/g)].map((m) => m[1]).filter(Boolean);
+            const norm = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase().trim();
+            const objetivo = norm(dependenciaEfectiva);
+            if (!opciones.some((o) => norm(o) === objetivo)) {
+                const candidata = opciones.find((o) => norm(o).includes(objetivo))
+                    || opciones.find((o) => objetivo.split(/\s+/).filter(w => w.length > 2).every((w) => norm(o).includes(w)));
+                if (candidata) {
+                    console.error(`dependencia "${dependenciaEfectiva}" ajustada a la opcion oficial "${candidata}".`);
+                    dependenciaEfectiva = candidata;
+                }
+            }
+        }
+    }
+    const body = new URLSearchParams({
+        s: "1",
+        jurisdiccion: params.jurisdiccion || "nacional",
+        tipo_norma: tipoSlug,
+        numero: params.numeroNorma || "",
+        anio: anioEfectivo,
+        dependencia: dependenciaEfectiva,
+        publicacion_desde: params.publicacionDesde ? (normalizeInfoLegDate(params.publicacionDesde) || params.publicacionDesde) : "",
+        publicacion_hasta: params.publicacionHasta ? (normalizeInfoLegDate(params.publicacionHasta) || params.publicacionHasta) : "",
+        texto: params.texto || "",
+        tarro_de_miel: "", // honeypot: siempre vacio
+        form_build_id: fbid,
+        form_id: "infoleg_normativa_search_form"
+    });
+    const response = await axios.post(url, body.toString(), {
+        httpsAgent,
+        headers: {
+            ...OFFICIAL_HEADERS,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": `${ARGENTINA_BASE_URL}/normativa`,
+            "Origin": ARGENTINA_BASE_URL
+        },
+        responseType: "arraybuffer",
+        maxRedirects: 5
+    });
+    const contentType = String(response.headers["content-type"] || "").toLowerCase();
+    const charset = contentType.match(/charset=([^;]+)/)?.[1]?.trim() || "utf-8";
+    const html = new TextDecoder(charset.includes("8859") ? "latin1" : "utf-8").decode(response.data);
+    assertNotWafPage(html, url);
+    return { url, ...parseNormativaListHtml(html, { allowAnchorScan: true }) };
+}
 export async function searchNormativaOfficial(params) {
     const url = buildNormativaSearchUrl(params);
-    // Intento estatico (rapido). NOTA: el buscador de argentina.gob.ar renderiza
-    // los resultados por JS, asi que el HTML estatico casi siempre trae 0.
+    // Via primaria: POST del formulario (server-rendered, sin Puppeteer).
     let parsed = { countText: "", results: [] };
     let staticError = null;
+    let metodo = "POST formulario oficial";
     try {
-        const html = await fetchOfficialHtml(url);
-        // Sin anchor-scan: el HTML estatico solo es confiable si trae la tabla
-        // de resultados real (ver nota en parseNormativaListHtml).
-        parsed = parseNormativaListHtml(html, { allowAnchorScan: false });
+        const post = await searchNormativaViaPost(params);
+        if (post.results.length > 0 || post.countText) {
+            return { url: post.url, countText: post.countText, results: post.results, metodo };
+        }
+        // POST respondio pero sin resultados parseados: puede ser un "0 real".
+        parsed = { countText: post.countText, results: post.results };
     }
     catch (err) {
         staticError = err;
+        console.error(`POST del buscador fallo: ${err.message}`);
     }
-    let metodo = "HTML estatico";
-    // FIX BUSCADOR CIEGO: render real de la pagina con Puppeteer. La SPA lee
-    // los parametros de la URL, dispara su XHR interno y pinta los resultados;
-    // no hace falta conocer el endpoint JSON.
+    metodo = "POST sin resultados";
+    // Fallback: render real de la pagina con Puppeteer (solo si el POST fallo
+    // o devolvio 0; cubre eventuales cambios futuros del formulario).
     if (parsed.results.length === 0) {
         try {
             const rendered = await fetchWithPuppeteer(url, {
@@ -665,6 +743,9 @@ async function searchCentralSolr(keys) {
         }
         catch (puppeteerErr) {
             console.error(`Fallback Puppeteer tambien fallo: ${puppeteerErr.message}`);
+            const connErr = buildConnectionError(err, url);
+            connErr.message += `\n\n**Fallback Puppeteer:** ${puppeteerErr.message}`;
+            throw connErr;
         }
         throw buildConnectionError(err, url);
     }
@@ -1041,13 +1122,20 @@ export function detectSolidaryLiability(text) {
 export function registerAllTools(server) {
     server.tool("buscar_normativa", "Busca normativas (Leyes, Decretos, Resoluciones) en InfoLEG por palabras clave y criterios técnicos.", {
         criterio: z.string().describe("Términos clave de búsqueda legal (ej. 'maternidad', 'blanqueo de capitales')"),
+        fraseExacta: z.boolean().optional().describe("Si es true, busca el criterio como frase exacta (entre comillas) en el motor de InfoLEG. Reduce drásticamente el ruido en criterios de varias palabras (ej. 'locación de obra' suelto matchea 400k+ documentos ajenos)."),
         tipoNorma: z.string().optional().describe("Tipo de norma (ej. 'Ley', 'Decreto', 'Resolución')"),
         numeroNorma: stringOrNumberOptional.describe("Número de norma sin puntos (ej. '27430')"),
         anioNorma: stringOrNumberOptional.describe("Año de sanción original (ej. '2017')"),
         pagina: z.number().optional().default(1).describe("Página de resultados")
     }, async (args) => {
         try {
-            let searchQuery = args.criterio;
+            // Frase exacta: el motor Solr de InfoLEG acepta comillas dobles.
+            // Sin ellas, un criterio multipalabra matchea cada palabra en
+            // cualquier parte del texto (ruido masivo, verificado 10/6/26).
+            const yaTieneComillas = /^".*"$/.test(args.criterio.trim());
+            let searchQuery = (args.fraseExacta && !yaTieneComillas)
+                ? `"${args.criterio.trim()}"`
+                : args.criterio;
             if (args.tipoNorma)
                 searchQuery += ` "${args.tipoNorma}"`;
             if (args.numeroNorma)

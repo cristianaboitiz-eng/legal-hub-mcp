@@ -92,6 +92,40 @@ npm install
 ```
 (Descarga Chrome para Puppeteer, ~150-200 MB; puede tardar varios minutos.) Luego reiniciar Claude Desktop y re-probar `infoleg__buscar_normativa` "locacion de obra". Si con Puppeteer instalado da 0 o irrelevantes, la SPA no auto-ejecuta la busqueda desde la URL: capturar el XHR real con DevTools (F12 → Network → buscar en la pagina) y pasar la URL del request.
 
+## RONDA 4 (re-test del 10/6, noche)
+
+Estado: JUBA ✅, NormativaPBA ✅✅. InfoLEG sigue en 403 pero con dato nuevo decisivo: **el navegador del usuario ya accede a servicios.infoleg (407.805 resultados para "locacion de obra") → el ban de IP expiró**. El 403 que persiste contra el MCP es fingerprinting del WAF (axios sin JS), exactamente el caso que cubre el fallback Puppeteer... que sigue sin poder ejecutarse porque **`npm install` aún no se corrió** (verificado: `node_modules/puppeteer` no existe).
+
+Mejoras de esta ronda:
+- `searchCentralSolr`: el motivo del fallo de Puppeteer ahora viaja en el mensaje de error visible (antes solo consola).
+- `buscar_normativa`: nuevo parámetro `fraseExacta` (true → envía el criterio entre comillas al Solr de InfoLEG). Responde al ruido detectado: "locacion de obra" suelto matchea cada palabra en cualquier parte del texto (designaciones, MERCOSUR, edificación, etc.).
+
+**Acción pendiente (la misma de Ronda 3, es el único gate):**
+```
+cd C:\Users\Ximena\mcp-legal-ar\servers\legal-mcp
+npm install
+```
+Reiniciar Claude Desktop y probar `infoleg__buscar_normativa` con criterio "locacion de obra" y `fraseExacta: true`. Captura de DevTools: solo si tras instalar Puppeteer persiste el 403 (improbable, dado que el ban expiró y Puppeteer presenta huella de Chrome real).
+
+## RONDA 5 (cierre) - EL BUSCADOR NACIONAL RESUELTO
+
+Hallazgo definitivo (del HTML crudo del formulario): el buscador de argentina.gob.ar/normativa NO es una SPA con XHR. Es un form Drupal `method="POST"`: los resultados se renderizan server-side solo en la respuesta del POST; todo GET devuelve el formulario vacio. Por eso el parser veia 0 y Puppeteer tampoco ayudaba.
+
+Protocolo implementado en `searchNormativaViaPost` (via primaria de `searchNormativaOfficial`):
+1. GET /normativa → extraer `form_build_id` fresco.
+2. POST /normativa?{limit,offset} con campos: s=1, jurisdiccion, tipo_norma (slugs plurales: leyes/decretos/decretos_ley/...), numero, anio, dependencia, publicacion_desde/hasta, texto, `tarro_de_miel` VACIO (honeypot anti-bot), form_build_id, form_id=infoleg_normativa_search_form. Sin captcha en este form.
+3. Reglas del form replicadas: tipo "leyes" no admite anio (se omite con aviso; filtrar leyes por numero); dependencia se ajusta a la opcion oficial del select por matching insensible a tildes/mayusculas.
+
+Verificacion final (test-busqueda-post.mjs en maquina del usuario):
+- "locacion de obra" texto libre → 407.808 normas, 50 devueltas via POST ✅ (mismo conteo que el navegador)
+- Ley 27430 con anio 2017 → omite anio, devuelve exactamente Ley 27430 (id 305262) ✅
+- Leyes + dependencia "Ministerio de Trabajo" → 0 correcto (las leyes emanan del Congreso, no de ministerios; conjunto vacio por definicion)
+
+Estado final del modulo InfoLEG:
+- Busquedas nacionales: ✅ via POST a argentina.gob.ar (sin tocar el host baneado, sin Puppeteer)
+- Texto por ID: ✅ via argentina.gob.ar/{id}/texto (original; actualizado con advertencia mientras dure el ban)
+- servicios.infoleg.gob.ar: sigue baneado para trafico automatizado de esta IP (tambien a Puppeteer); el buscador clasico Solr y texact.htm vuelven solos cuando el WAF levante el ban, porque siguen primeros en la cadena de intentos.
+
 ## PENDIENTES / RIESGOS CONOCIDOS
 - **No verificado en vivo:** que la SPA de argentina.gob.ar auto-ejecute la busqueda al cargar la URL con parametros bajo Puppeteer (el sandbox de esta sesion no podia correr node ni navegador). Si el test 8 da 0 resultados, el siguiente paso es capturar el XHR real con DevTools (pestaña Network al buscar) y pegarme la URL del request.
 - El "texto actualizado" consolidado sigue dependiendo de `texact.htm` en servicios.infoleg (host baneado para tu IP): mientras dure el ban, las consultas `actualizado` devuelven el original con advertencia.
