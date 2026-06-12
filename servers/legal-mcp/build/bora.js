@@ -1016,59 +1016,68 @@ Este servidor es un puente automatizado de información pública legal y no cons
         pagina: z.number().optional().default(1).describe("Número de página")
     }, async (args) => {
         try {
-            const tipoAviso = args.tipoAviso || "";
-            const criterioAdicional = args.criterio || "";
-            let queryText = criterioAdicional;
-            if (tipoAviso === "sucesion") {
-                queryText = queryText ? `"sucesion" ${queryText}` : "sucesion";
-            }
-            else if (tipoAviso === "declaratoria") {
-                queryText = queryText ? `"declaratoria de herederos" ${queryText}` : `"declaratoria de herederos"`;
-            }
-            else if (tipoAviso === "inhibicion") {
-                queryText = queryText ? `"inhibicion general de bienes" ${queryText}` : `"inhibicion general de bienes"`;
-            }
-            else if (tipoAviso === "edicto") {
-                queryText = queryText ? `edicto ${queryText}` : "edicto";
-            }
-            else if (tipoAviso === "quiebra") {
-                queryText = queryText ? `quiebra ${queryText}` : "quiebra";
-            }
-            else if (tipoAviso === "concurso") {
-                queryText = queryText ? `"concurso preventivo" ${queryText}` : `"concurso preventivo"`;
-            }
-            else if (tipoAviso === "remate") {
-                queryText = queryText ? `remate ${queryText}` : "remate";
-            }
-            if (!queryText) {
-                queryText = "judicial"; // fallback
-            }
-            // FIX 2026-06-11 (Warning 2 del informe de tests): la Segunda Sección
-            // mezcla rubros comerciales (Avisos Comerciales, Convocatorias,
-            // Transferencias, Balances) con los edictos judiciales, y el ranking
-            // del backend de BORA suele poner los comerciales primero. El campo
-            // details[0] del resultado (aquí "norma") trae la etiqueta del rubro,
-            // así que se filtra por whitelist judicial y se barren páginas
-            // adicionales hasta juntar resultados útiles.
-            const esRubroJudicial = (r) => {
-                const rubro = (r.norma || "").toLowerCase();
-                if (!rubro)
-                    return true; // sin etiqueta: no descartar (puede ser edicto sin rubro)
-                return /edicto|judicial|sucesi|quiebra|concurso|remate|heredero|inhibici/.test(rubro);
+            // FIX 2026-06-12 (ronda 20, reemplaza al fix de ronda 15): los
+            // edictos judiciales NO contienen literalmente terminos como
+            // "sucesion" (el texto es "...cita y emplaza a herederos y
+            // acreedores de [CAUSANTE]..." y el titulo es el nombre del
+            // causante), por lo que la busqueda TEXTUAL nunca los alcanzaba:
+            // solo devolvia avisos comerciales que mencionan la palabra.
+            // Verificado en vivo 12/06/2026: la edicion del dia tenia ~88
+            // sucesiones bajo el rubro "EDICTOS JUDICIALES - SUCESIONES" y la
+            // busqueda por texto devolvia 0.
+            // Estrategia nueva: busqueda con TEXTO VACIO acotada por fecha
+            // (por defecto la edicion del dia), que devuelve el listado
+            // completo de la Segunda Seccion, filtrando localmente por la
+            // etiqueta de rubro que viene en details[0] ("norma"). El criterio
+            // del usuario (apellido del causante / autos) se aplica localmente
+            // sobre titulo y extracto.
+            const normalizar = (s) => (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+            const RUBRO_POR_TIPO = {
+                sucesion: /sucesi/,
+                declaratoria: /sucesi|citaci|edicto/,
+                inhibicion: /citaci|notificaci|edicto/,
+                edicto: /edicto|judicial/,
+                quiebra: /quiebra|concurso/,
+                concurso: /quiebra|concurso/,
+                remate: /remates? judicial/
             };
+            // "remates? judicial" y no "remate" a secas: el rubro "Remates
+            // Comerciales" (subastas prendarias extrajudiciales) no es aviso
+            // judicial (verificado 12/06: colaba el del Banco Patagonia).
+            const RUBRO_JUDICIAL_GENERAL = /edicto|judicial|sucesi|quiebra|concurso|remates? judicial|heredero|inhibici|citaci|notificaci/;
+            const matcherRubro = (args.tipoAviso && RUBRO_POR_TIPO[args.tipoAviso]) || RUBRO_JUDICIAL_GENERAL;
+            const esRubroJudicial = (r) => {
+                const rubro = normalizar(r.norma);
+                if (!rubro)
+                    return false; // en el barrido completo del dia, sin etiqueta = no judicial
+                return RUBRO_JUDICIAL_GENERAL.test(rubro) && matcherRubro.test(rubro);
+            };
+            const criterioNorm = normalizar(args.criterio || "");
+            const matchCriterio = (r) => !criterioNorm
+                || normalizar(r.titulo).includes(criterioNorm)
+                || normalizar(r.extracto).includes(criterioNorm);
+            // Rango de fechas: por defecto la edicion del dia. Sin acotar,
+            // el texto vacio devolveria el historico completo.
+            const hoyDDMM = normalizeDateToDDMMYYYY(getArgentinaTodayString());
+            const fechaDesde = args.fechaDesde || hoyDDMM;
+            const fechaHasta = args.fechaHasta || hoyDDMM;
+            const queryText = ""; // texto vacio: listado completo del rango
             const judiciales = [];
             let escaneados = 0;
             let descartados = 0;
             let paginasLeidas = 0;
-            const MAX_PAGINAS = 5;
+            // Una edicion de la Segunda Seccion ronda los 300-450 avisos y el
+            // ordenamiento pone los rubros judiciales al FINAL, por eso el
+            // barrido llega hasta 15 paginas (antes 5: insuficiente).
+            const MAX_PAGINAS = 15;
             const OBJETIVO = 25;
             let pagina = args.pagina || 1;
             while (paginasLeidas < MAX_PAGINAS && judiciales.length < OBJETIVO) {
                 const lote = await buscarAvisos({
                     criterio: queryText,
                     seccion: [2],
-                    fechaDesde: args.fechaDesde,
-                    fechaHasta: args.fechaHasta,
+                    fechaDesde,
+                    fechaHasta,
                     pagina
                 });
                 paginasLeidas++;
@@ -1076,7 +1085,7 @@ Este servidor es un puente automatizado de información pública legal y no cons
                     break; // no hay más resultados
                 escaneados += lote.length;
                 for (const r of lote) {
-                    if (esRubroJudicial(r))
+                    if (esRubroJudicial(r) && matchCriterio(r))
                         judiciales.push(r);
                     else
                         descartados++;
@@ -1084,20 +1093,29 @@ Este servidor es un puente automatizado de información pública legal y no cons
                 pagina++;
             }
             if (judiciales.length === 0) {
-                let msg = `No se encontraron avisos judiciales para la búsqueda '${queryText}'.`;
-                if (descartados > 0)
-                    msg += ` Se escanearon ${escaneados} avisos en ${paginasLeidas} página(s); todos pertenecían a rubros no judiciales (${descartados} descartados, ej. Avisos Comerciales). Pruebe con otro criterio o ajuste el rango de fechas.`;
+                let msg = `No se encontraron avisos judiciales`;
+                if (args.tipoAviso)
+                    msg += ` del tipo '${args.tipoAviso}'`;
+                if (args.criterio)
+                    msg += ` que coincidan con '${args.criterio}'`;
+                msg += ` entre ${fechaDesde} y ${fechaHasta}.`;
+                if (escaneados > 0) {
+                    msg += ` Se escanearon ${escaneados} avisos en ${paginasLeidas} página(s) de la Segunda Sección (${descartados} descartados). Recuerde que el título del edicto sucesorio es el nombre del causante.`;
+                }
+                else {
+                    msg += ` La edición de ese rango no devolvió avisos (puede ser día inhábil); pruebe con otra fecha.`;
+                }
                 return { content: [{ type: "text", text: msg }] };
             }
             const results = judiciales;
             let md = `# Avisos Judiciales BORA - Segunda Sección\n\n`;
             if (args.tipoAviso)
                 md += `*   **Tipo de Aviso:** ${args.tipoAviso.toUpperCase()}\n`;
-            md += `*   **Búsqueda Completa:** \`${queryText}\`\n`;
-            if (args.fechaDesde)
-                md += `*   **Desde:** ${args.fechaDesde}\n`;
-            if (args.fechaHasta)
-                md += `*   **Hasta:** ${args.fechaHasta}\n`;
+            if (args.criterio)
+                md += `*   **Criterio (filtro local sobre título/extracto):** \`${args.criterio}\`\n`;
+            md += `*   **Método:** listado completo de la edición filtrado por rubro judicial\n`;
+            md += `*   **Desde:** ${fechaDesde}\n`;
+            md += `*   **Hasta:** ${fechaHasta}\n`;
             md += `*   **Resultados judiciales:** ${results.length} (escaneados ${escaneados} avisos en ${paginasLeidas} página(s); ${descartados} descartados por rubro no judicial)\n\n---\n\n`;
             results.forEach((r, idx) => {
                 md += `### ${idx + 1}. ⚖️ ${r.titulo}\n`;
